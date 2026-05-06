@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip --version)",
+      "Bash(pip3 --version)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/python -m pip install langchain langchain-core langchain-openai langchain-community python-dotenv)"
+    ]
+  }
+}
