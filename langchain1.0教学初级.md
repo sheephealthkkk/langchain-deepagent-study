@@ -1096,153 +1096,736 @@ ai_msg = AIMessage(
 
 ---
 
-## 三、执行顺序：一条消息在 RAG 链中的完整旅程
+## 三、RunnableWithMessageHistory 用法详解
 
-以我们 `05_conversational_rag.py` 的链为例，追踪 `"How is it different from LangGraph?"` 这条用户输入是如何流经整个系统的。
+### 3.1 它解决什么问题
 
-### 阶段 0：进入链路前 — RunnableWithMessageHistory
-
-```
-用户输入: "How is it different from LangGraph?"
-session_id: "session_1"
-```
-
-`RunnableWithMessageHistory` 调用 `get_session_history("session_1")`，从 SQLite/内存中读取历史：
+没有 `RunnableWithMessageHistory` 时，每次调用 Chain 都需要手动管理聊天历史：
 
 ```python
-chat_history = [
-    HumanMessage("What is LangChain?"),               # ← 第1轮用户
-    AIMessage("当前知识库中没有相关信息。"),              # ← 第1轮AI
-]
+# ❌ 手动管理历史 — 繁琐且容易出错
+history = []
+
+# 第 1 轮
+r1 = chain.invoke({"input": "What is LangChain?", "history": history})
+history.append(HumanMessage("What is LangChain?"))
+history.append(AIMessage(r1))
+
+# 第 2 轮
+r2 = chain.invoke({"input": "How is it different?", "history": history})
+history.append(HumanMessage("How is it different?"))
+history.append(AIMessage(r2))
+
+# 每次都要记得传 history、记得追加、记得构造 HumanMessage/AIMessage
+# 换一个 session_id 还要手动切换不同的 history 列表
 ```
 
-将用户输入包装后注入链：
+`RunnableWithMessageHistory` 把这一切自动化：**调用前自动注入历史、调用后自动追加新消息、按 session_id 自动隔离不同会话**。
+
+### 3.2 六个参数逐个讲解
 
 ```python
-chain_input = {
-    "input": "How is it different from LangGraph?",
-    "chat_history": [HumanMessage(...), AIMessage(...)]
-}
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+runnable_with_history = RunnableWithMessageHistory(
+    runnable,                     # ① 底层真正干活的链
+    get_session_history,          # ② 根据 session_id 返回 BaseChatMessageHistory 对象
+    input_messages_key="input",   # ③ 用户输入在 dict 中的 key 名（入口）
+    history_messages_key="history", # ④ 历史消息注入到 dict 的哪个 key（桥梁）
+    output_messages_key="output", # ⑤ 模型回复在输出 dict 中的 key 名（出口）
+)
 ```
 
-### 阶段 1：子链1 — 历史感知检索器
+#### 参数 ①：`runnable` — 被包装的链
 
-链收到 dict → 子链1 先执行。
-
-**Step 1a：填模板**
-
-```
-contextualize_prompt 模板：
-┌──────────────────────────────────────────┐
-│ System: Given the chat history,          │
-│   formulate a standalone question...     │
-│                                          │
-│ MessagesPlaceholder("chat_history")      │
-│   ↓ 展开为：                              │
-│   Human: What is LangChain?              │  ← 从 chat_history[0]
-│   AI: 当前知识库中没有相关信息。            │  ← 从 chat_history[1]
-│                                          │
-│ Human: How is it different from          │  ← 从 {input}
-│        LangGraph?                        │
-└──────────────────────────────────────────┘
-```
-
-**MessagesPlaceholder 怎么展开的？**
+这是真正干活的 Runnable。可以是任何 Chain、Agent、LLM。`RunnableWithMessageHistory` 不关心它在做什么，只负责在调用它**之前**把历史注入 dict，在它返回**之后**从输出提取回答追加到历史。
 
 ```python
-# 内部逻辑（简化）
-# chat_history = [HumanMessage("What is LangChain?"), AIMessage("当前...")]
-# 直接逐条插入模板，保持原本的消息类型
-# HumanMessage 以 Human role 插入
-# AIMessage 以 AI role 插入
+# runnable 可以是简单 LLM
+runnable = prompt | llm | StrOutputParser()
+
+# 也可以是复杂 RAG 链
+runnable = create_retrieval_chain(retriever, qa_chain)
+
+# 也可以是 Agent
+runnable = create_agent(llm, tools)
 ```
 
-**Step 1b：LLM 改写**
+#### 参数 ②：`get_session_history` — 历史存取的回调函数
 
-完整 Prompt（System + History + Current Question）→ LLM → 独立问题。
-
-### 阶段 2：子链1 后半段 — Retriever
-
-```
-改写的查询: "How is LangChain different from LangGraph?"
-        │
-        ▼ 向量化（HuggingFaceEmbeddings.embed_query）
-  [0.023, -0.451, 0.892, ...]   ← float 列表
-        │
-        ▼ Chroma 余弦相似度计算
-  找到最相似的 4 个 Document
-        │
-        ▼
-  [Document("LangChain vs. LangGraph vs. Deep Agents\nUse LangGraph..."),
-   Document("..."),
-   Document("..."),
-   Document("...")]
-```
-
-### 阶段 3：create_retrieval_chain 拼接数据
-
-检索到的 4 个 Document 追加到 dict 的 `context` 字段：
+**这是整个机制的核心**。它是一个函数，接收 `session_id: str`，返回一个实现了 `BaseChatMessageHistory` 接口的对象。
 
 ```python
-chain_input_for_qa = {
-    "input": "How is it different from LangGraph?",
-    "chat_history": [HumanMessage(...), AIMessage(...)],
-    "context": [Document("LangChain vs. LangGraph..."), ...]  # ← 新字段
-}
+# === 内存实现（开发用）===
+from langchain_core.chat_history import InMemoryChatMessageHistory
+
+store: dict[str, InMemoryChatMessageHistory] = {}
+
+def get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+    """根据 session_id 返回对应的聊天历史。不存在则自动创建。"""
+    if session_id not in store:
+        store[session_id] = InMemoryChatMessageHistory()
+    return store[session_id]
+
+# === SQLite 实现（生产用）===
+# 见 06_persistent_rag.py 的 SQLiteChatMessageHistory
+# 重启后历史仍然保留
 ```
 
-### 阶段 4：子链2 — QA 链
+**为什么是回调函数而不是直接传对象？** 因为 `RunnableWithMessageHistory` 每次调用都要根据 `config` 中的 `session_id` 动态获取对应会话的历史。传一个函数让它自己调，比传一个固定的对象更灵活——同一个链实例可以同时服务多个 `session_id`。
 
-**Step 4a：Stuff Documents** — 把 `context` 中的 4 个 Document 拼成字符串填入 `{context}`。
+#### 参数 ③：`input_messages_key="input"` — 入口 Key
 
-**Step 4b：填 QA Prompt**
-
-```
-qa_prompt 模板：
-┌──────────────────────────────────────────┐
-│ System: You are a knowledgeable AI       │
-│   assistant. Answer based STRICTLY on    │
-│   the following context.                 │
-│                                          │
-│ ## Retrieved Context                     │
-│ LangChain vs. LangGraph vs. Deep Agents  │  ← {context}
-│ Use LangGraph, our low-level orch...     │
-│                                          │
-│ MessagesPlaceholder("chat_history")      │
-│   Human: What is LangChain?              │  ← 历史
-│   AI: 当前知识库中没有相关信息。            │
-│                                          │
-│ Human: How is it different from          │  ← {input}
-│        LangGraph?                        │
-└──────────────────────────────────────────┘
-```
-
-**Step 4c：LLM 生成**
-
-完整的 Prompt → DeepSeek API → AIMessage。
-
-### 阶段 5：离开链路后 — RunnableWithMessageHistory 追加
+指定用户传入 dict 中的**哪个字段**是用户当前的输入。框架从 `config` 中读出来的 `session_id` → 调 `get_session_history(session_id)` → 拿到历史 → **把历史和用户输入拼成一个新的 dict**：
 
 ```python
-# RunnableWithMessageHistory 从输出中提取 answer
-output = {
+# 用户调用时：
+runnable_with_history.invoke(
+    {"input": "How is it different?"},  # ← "input" 在用户 dict 中
+    config={"configurable": {"session_id": "session_1"}},
+)
+
+# 框架内部自动拼装：
+# {
+#     "input": "How is it different?",          ← 用户传的，原样保留
+#     "history": [HumanMessage(...), AIMessage(...)]  ← 框架自动注入！
+# }
+# ↑ "history" 就是 history_messages_key 指定的 key
+```
+
+**为什么用户只传 `input` 而不传 `history`？** 因为历史应该由框架管理，不应该让用户手动传——用户只需要关心当前要问什么。
+
+#### 参数 ④：`history_messages_key="history"` — 桥梁 Key
+
+指定**历史消息列表**在 dict 中的 key 名。框架将 `get_session_history` 返回的 `messages` 列表注入到 dict 的这个 key 下。
+
+```python
+# 这个 key 必须和 Chain 的 Prompt 模板中的 MessagesPlaceholder 名称对应！
+
+# RunnableWithMessageHistory 侧：
+history_messages_key = "history"               # ← 框架拼 dict 时用的 key
+
+# Prompt 模板侧：
+MessagesPlaceholder("history")                 # ← 模板中占位符的名字
+
+# 两者必须一致！否则历史消息注入不了模板。
+```
+
+**为什么叫"桥梁 Key"？** 它是 RunnableWithMessageHistory（历史管理）和 Prompt 模板（消息构造）之间的**唯一耦合点**。改了这个 key，两头都要改。
+
+#### 参数 ⑤：`output_messages_key="output"` — 出口 Key
+
+指定链的输出 dict 中**哪个字段是 AI 的最终回答**。框架从输出中提取这个字段的值，追加到聊天历史。
+
+```python
+# rag_chain 的输出（由 create_retrieval_chain 构造）：
+{
     "input": "How is it different from LangGraph?",
     "chat_history": [...],
     "context": [Document, ...],
-    "answer": "LangChain 是一个高级框架，LangGraph 是低级编排框架..."
+    "answer": "LangChain 是一个高级框架..."  ← output_messages_key 指向这里
 }
 
-# 从 output_messages_key="answer" 取回答，从 input_messages_key="input" 取问题
-# 追加到 chat_history：
-chat_history.append(HumanMessage("How is it different from LangGraph?"))
-chat_history.append(AIMessage("LangChain 是一个高级框架..."))
+# 框架提取：output["answer"] → AIMessage("LangChain 是一个高级框架...")
+# 然后追加到 history.add_message(AIMessage(...))
 ```
 
-**下次再调用时，chat_history 就变成 4 条消息了。**
+**如果链的输出是纯字符串（不是 dict）怎么办？** 那就不需要这个参数。框架直接把整个字符串当作回答追加到历史：
+
+```python
+# 链的输出是纯字符串
+chain = prompt | llm | StrOutputParser()
+result = chain.invoke({"input": "Hi"})
+# → "Hello! How can I help you?"（纯字符串）
+
+# RunnableWithMessageHistory 会直接把字符串包装为 AIMessage 追加
+```
+
+### 3.3 完整使用示例（从创建到调用）
+
+```python
+# ================================================================
+# RunnableWithMessageHistory 完整用法
+# ================================================================
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI
+
+# ---- 第 1 步：创建底层链 ----
+# 这个链需要有 MessagesPlaceholder 来接收历史消息
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是友好助手。"),
+    MessagesPlaceholder("history"),   # ← 历史消息注入位置
+    ("human", "{input}"),             # ← 用户当前输入
+])
+
+llm = ChatOpenAI(model="deepseek-v4-pro")
+chain = prompt | llm | StrOutputParser()
+# 注意：此时 chain 还没有记忆功能。如果直接调 chain.invoke({"input": "Hi"})
+# 会因为缺少 "history" 字段而报错——MessagesPlaceholder 需要这个字段。
+
+# ---- 第 2 步：定义历史存取回调 ----
+store = {}
+
+def get_session_history(session_id: str):
+    """根据 session_id 获取对应的聊天历史。"""
+    if session_id not in store:
+        store[session_id] = InMemoryChatMessageHistory()
+    return store[session_id]
+
+# ---- 第 3 步：包装为有记忆的链 ----
+chain_with_memory = RunnableWithMessageHistory(
+    runnable=chain,                      # 底层链
+    get_session_history=get_session_history,
+    input_messages_key="input",          # 用户传 {"input": "..."}
+    history_messages_key="history",      # 历史注入到 "history" 字段
+    # output_messages_key 不指定——因为 chain 输出是纯字符串 (StrOutputParser)
+)
+
+# ---- 第 4 步：多轮对话 ----
+config = {"configurable": {"session_id": "chat_1"}}
+
+# 第 1 轮
+r1 = chain_with_memory.invoke(
+    {"input": "我叫 Alice，我喜欢 Python"},
+    config=config,
+)
+print(f"AI: {r1}")  # → "你好 Alice！Python 很棒的..."
+
+# 第 2 轮 — 不需要手动传历史！
+r2 = chain_with_memory.invoke(
+    {"input": "我叫什么？我喜欢什么语言？"},
+    config=config,
+)
+print(f"AI: {r2}")  # → "你叫 Alice，你喜欢 Python！"
+# RunnableWithMessageHistory 自动把第 1 轮的对话注入到了 Prompt 中
+
+# 第 3 轮 — 换一个 session_id → 全新记忆
+config_new = {"configurable": {"session_id": "chat_2"}}
+r3 = chain_with_memory.invoke(
+    {"input": "我叫什么？"},
+    config=config_new,
+)
+print(f"AI: {r3}")  # → "我不知道你的名字，这是我们第一次对话。"
+```
+
+### 3.4 参数对应关系图
+
+```
+用户调用                      RunnableWithMessageHistory                底层 Chain
+────────                    ──────────────────────────                ──────────
+
+invoke(
+  {"input": "Hi"},  ─────────→  提取 "input" 字段                      
+  config={                       ↓                                      
+    "session_id": "s1"         调 get_session_history("s1")            
+  }                              ↓                                      
+)                              拼接:                                   
+                                {                                      
+                                  "input": "Hi",       ← input_messages_key
+                                  "history": [          ← history_messages_key
+                                    HumanMsg("..."),                 
+                                    AIMsg("..."),                    
+                                  ],                                  
+                                }                                      
+                                  │                                    
+                                  ▼                                    
+                              chain.invoke(上面的dict) ────────────→  prompt 填模板
+                                                                       │ {input}→"Hi"
+                                                                       │ MessagesPlaceholder("history")
+                                                                       │  ← 展开为 HumanMsg+AIMsg
+                                                                       ▼
+                                                                     LLM 生成回答
+                                                                       │
+                                                                       ▼
+                              ←────────── "Hello Alice!" ──────────  返回值(纯字符串)
+                                │
+                                ▼
+                              追加到历史:
+                                HumanMsg("Hi")
+                                AIMsg("Hello Alice!")
+                                │
+                                ▼
+返回给用户: "Hello Alice!"
+```
+
+### 3.5 常见问题
+
+**Q: 什么时候需要 `output_messages_key`？**
+
+当底层链的输出是 **dict 格式**时。例如 `create_retrieval_chain` 返回 `{"input":..., "chat_history":..., "context":..., "answer":...}`。框架需要知道取哪个字段作为 AI 回答。
+
+当底层链的输出是**纯字符串**时（用了 `StrOutputParser`），不需要指定——框架自动把整个字符串当作回答。
+
+**Q: `input_messages_key` 和 `history_messages_key` 可以取任意名字吗？**
+
+可以，但必须和 Prompt 模板中的对应字段名一致。常用的命名约定：
+- `input_messages_key="input"` → 模板中 `{input}`
+- `history_messages_key="history"` → 模板中 `MessagesPlaceholder("history")`
+- 或者 `history_messages_key="chat_history"` → 模板中 `MessagesPlaceholder("chat_history")`
+
+**Q: 如果底层链同时需要 `{input}` 和 `{context}`（如 RAG），怎么传？**
+
+`RunnableWithMessageHistory` 只注入 `history_messages_key` 这一项。`{context}` 由 `create_retrieval_chain` 内部从 retriever 的结果注入，不经过 `RunnableWithMessageHistory`。
+
+### 3.6 一句话概括
+
+**`RunnableWithMessageHistory` 本质上是一个"自动追加聊天记录的代理"**：你在外层调用 `chain_with_memory.invoke({"input": "新消息"})`，它内部替你做了三件事——(1) 根据 `session_id` 取出历史消息列表，(2) 把历史消息通过 `MessagesPlaceholder` 注入底层 Runnable，(3) 底层 Runnable 返回后，把本轮对话自动追加回历史。底层那个 Runnable（`prompt | llm | parser`）通过 `MessagesPlaceholder` 接收历史，每次 `invoke` 看到的是"历史消息 + 当前输入"拼好的完整 Prompt，所以它自然就有了上下文记忆。
 
 ---
 
-## 四、完整时序图
+## 四、执行顺序：一条消息在 RAG 链中的完整旅程
+
+本小节用 `05_conversational_rag.py` 的链为蓝本，逐行追踪 `"How is it different from LangGraph?"` 从用户输入到最终回答的**每一个函数调用、每一次数据变形、每一步为什么这样设计**。
+
+### 3.1 先看清整条链的结构
+
+在追踪执行之前，先回顾 `05_conversational_rag.py` 是怎么拼出这条链的。这决定了运行时数据如何流转。
+
+```python
+# ===== 05_conversational_rag.py 的链组装代码（去掉了无关细节）=====
+
+# 步骤 ①：加载向量库 → 创建 retriever
+vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
+retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+
+# 步骤 ②：子链1 — 历史感知检索器
+# 内部做的事：chat_history + input → LLM改写为独立问题 → 用改写后的问题检索
+contextualize_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Given the chat history...formulate a standalone question..."),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+history_aware_retriever = create_history_aware_retriever(
+    llm=llm, retriever=retriever, prompt=contextualize_prompt
+)
+
+# 步骤 ③：子链2 — QA 链
+# 内部做的事：context + chat_history + input → 拼接 → 填模板 → LLM 生成回答
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Answer based STRICTLY on context...\n\n{context}"),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+qa_chain = create_stuff_documents_chain(llm=llm, prompt=qa_prompt)
+
+# 步骤 ④：主 RAG Chain — 把子链1和子链2串起来
+# create_retrieval_chain 做的事：
+#   输入 {"input": ..., "chat_history": ...}
+#     → history_aware_retriever 执行 → 拿到 [Document, ...]
+#     → 拼成 {"input": ..., "chat_history": ..., "context": [Document, ...]}
+#     → qa_chain 执行 → 拿到最终回答
+rag_chain = create_retrieval_chain(
+    retriever=history_aware_retriever,
+    combine_docs_chain=qa_chain,
+)
+
+# 步骤 ⑤：包装会话记忆 — 这是最外层，用户直接调用的入口
+store: dict[str, InMemoryChatMessageHistory] = {}
+def get_session_history(session_id):
+    if session_id not in store:
+        store[session_id] = InMemoryChatMessageHistory()
+    return store[session_id]
+
+conversational_rag_chain = RunnableWithMessageHistory(
+    runnable=rag_chain,                     # ← 被包装的 RAG 链
+    get_session_history=get_session_history, # ← 回调：根据 session_id 获取历史
+    input_messages_key="input",             # ← 用户的输入从 dict 的哪个 key 取
+    history_messages_key="chat_history",    # ← 历史消息注入到 dict 的哪个 key
+    output_messages_key="answer",           # ← 输出的回答从 dict 的哪个 key 取（追加到历史）
+)
+```
+
+**五个步骤的关系图**：
+
+```
+conversational_rag_chain  ← 用户代码调用这个
+  = RunnableWithMessageHistory  ← 包装器：自动管理 chat_history
+      └─ rag_chain  ← 主链
+           = create_retrieval_chain  ← 组装器：先检索 → 再 QA
+                ├─ history_aware_retriever  ← 子链1：改写问题 + 检索
+                │    = create_history_aware_retriever(llm, retriever, prompt)
+                └─ qa_chain  ← 子链2：拼接文档 + LLM 生成
+                     = create_stuff_documents_chain(llm, prompt)
+```
+
+---
+
+### 3.2 阶段 0：`RunnableWithMessageHistory` 接管请求
+
+#### 它是什么
+
+`RunnableWithMessageHistory` 是一个**包装器（Wrapper）**，接收任何 Runnable（这里是 `rag_chain`），在调用前后自动处理聊天历史的读写。它自己不参与 LLM 推理——它只负责 **"调用前注入历史，调用后追加新消息"**。
+
+#### 谁调用了它
+
+用户代码只和 `conversational_rag_chain` 交互，不直接碰 `rag_chain`：
+
+```python
+# 用户代码 — 这是整条链的触发点
+response = conversational_rag_chain.invoke(
+    {"input": "How is it different from LangGraph?"},   # ← 只传 input！
+    config={"configurable": {"session_id": "session_1"}}, # ← 指定线程ID
+)
+# 注意：用户不需要传 chat_history —— RunnableWithMessageHistory 会自动处理。
+```
+
+#### 它内部做了什么
+
+当 `conversational_rag_chain.invoke(...)` 被调用时，`RunnableWithMessageHistory` 在**真正执行 rag_chain 之前**先跑自己的逻辑：
+
+```python
+# === RunnableWithMessageHistory.invoke() 内部逻辑（框架代码，非用户写的）===
+
+# 第 1 步：从 config 中提取 session_id
+session_id = config["configurable"]["session_id"]     # → "session_1"
+
+# 第 2 步：调用 get_session_history(session_id)
+# 这个函数是用户在创建链时提供的回调（见步骤 ⑤）
+# 它返回一个 BaseChatMessageHistory 对象（内存或 SQLite 实现）
+history = get_session_history("session_1")
+# → 返回 InMemoryChatMessageHistory 实例
+#   如果 "session_1" 第一次用 → store 中创建新的，messages=[]
+#   如果之前用过 → 返回已有的，messages=[HumanMessage("What is LangChain?"), AIMessage("没有相关信息")]
+
+# 第 3 步：从 history 中读出所有历史消息
+chat_history_messages = history.messages
+# → [HumanMessage("What is LangChain?"), AIMessage("当前知识库中没有相关信息。")]
+
+# 第 4 步：把用户输入和历史消息拼成 rag_chain 需要的 dict
+chain_input = {
+    "input": "How is it different from LangGraph?",  # ← 用户传入的 input
+    "chat_history": chat_history_messages,            # ← 框架自动注入的历史
+    # ↑ 这个 key 对应 history_messages_key="chat_history"
+}
+```
+
+**关键理解**：用户传的是 `{"input": "..."}`，但 `rag_chain` 收到的是 `{"input": "...", "chat_history": [...]}`。`RunnableWithMessageHistory` 在中间做了**"自动拼装"**——用户不需要手动管理历史，框架替你做了。
+
+---
+
+### 3.3 阶段 1：`create_retrieval_chain` 把 dict 路由给子链1
+
+`rag_chain`（由 `create_retrieval_chain` 创建）收到了上一步拼好的 dict：
+
+```python
+{
+    "input": "How is it different from LangGraph?",
+    "chat_history": [HumanMessage("What is LangChain?"), AIMessage("当前知识库中没有相关信息。")]
+}
+```
+
+`create_retrieval_chain` 的设计是：**先调 retriever（子链1），把结果拼成 context，再调 combine_docs_chain（子链2）**。
+
+```python
+# === create_retrieval_chain 内部逻辑（框架代码，简化）===
+
+# 第 1 步：把整个 dict 传给 history_aware_retriever
+retrieved_docs = history_aware_retriever.invoke({
+    "input": "How is it different from LangGraph?",
+    "chat_history": [HumanMessage(...), AIMessage(...)],
+})
+# → [Document("LangChain vs. LangGraph..."), Document("..."), ...]
+
+# 第 2 步：把检索结果拼到 dict 里（新增 context 字段）
+# 这一步在框架内部自动完成，用户看不到
+qa_input = {
+    "input": "How is it different from LangGraph?",
+    "chat_history": [HumanMessage(...), AIMessage(...)],
+    "context": retrieved_docs,  # ← 框架自动追加的！
+}
+
+# 第 3 步：传给 qa_chain
+final_answer = qa_chain.invoke(qa_input)
+```
+
+"拼接数据"不是用户写的代码——是 `create_retrieval_chain` 这个工厂函数内置的逻辑。
+
+---
+
+### 3.4 阶段 2：子链1 — `history_aware_retriever` 内部三步
+
+子链1 收到 `{"input": "...", "chat_history": [...]}`。它由 `create_history_aware_retriever` 创建，内部做三件事。
+
+#### Step 2a：`contextualize_prompt` 把 dict 填成 Prompt
+
+```python
+# contextualize_prompt 是一个 ChatPromptTemplate：
+contextualize_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Given the chat history and the latest user question, "
+               "formulate a standalone question which can be understood "
+               "without the chat history. Do NOT answer the question, "
+               "just reformulate it if needed..."),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+# .invoke() 时：
+#   1. {input} → 替换为 "How is it different from LangGraph?"
+#   2. MessagesPlaceholder("chat_history") → 展开为两条消息
+#   3. 生成最终的 ChatPromptValue（包含 4 条消息）
+filled_prompt = contextualize_prompt.invoke({
+    "input": "How is it different from LangGraph?",
+    "chat_history": [
+        HumanMessage("What is LangChain?"),
+        AIMessage("当前知识库中没有相关信息。"),
+    ],
+})
+```
+
+填入后 LLM 实际收到的 Prompt：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ SystemMessage:                                                │
+│   "Given the chat history and the latest user question,      │
+│    formulate a standalone question which can be understood    │
+│    without the chat history. Do NOT answer the question..."   │
+│                                                              │
+│ HumanMessage: "What is LangChain?"          ← chat_history[0] │
+│ AIMessage:    "当前知识库中没有相关信息。"     ← chat_history[1] │
+│ HumanMessage: "How is it different from     ← {input} 填入    │
+│                LangGraph?"                                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**为什么 MessagesPlaceholder 要用 HumanMessage/AIMessage 展开，而不是拼成字符串？**
+因为 Chat Model 需要区分"谁说的"——System 是指令、Human 是用户历史、AI 是之前的回答。如果拼成纯文本，模型就看不到角色边界了。
+
+#### Step 2b：LLM 改写问题
+
+```python
+# create_history_aware_retriever 内部（框架代码，简化）
+# 把填好的 Prompt 发给 LLM
+rewrite_result = llm.invoke(filled_prompt)
+# → AIMessage(content="How is LangChain different from LangGraph?")
+
+# LLM 做的事：看到对话历史中有 "What is LangChain?"，理解当前问题中的
+# "it" 指的是 "LangChain"，于是把 "it" 替换掉，生成一个独立的检索查询。
+```
+
+**为什么需要改写？** 用户说的 "it" 在向量库中搜不到任何东西——向量库里存的是 "LangChain" 不是 "it"。改写后的 "How is LangChain different from LangGraph?" 才能命中相关文档。
+
+#### Step 2c：用改写后的查询去检索
+
+```python
+# create_history_aware_retriever 内部（框架代码，简化）
+standalone_query = rewrite_result.content
+# → "How is LangChain different from LangGraph?"
+
+# 用改写后的文本去向量库做语义检索
+retrieved_docs = retriever.invoke(standalone_query)
+# → [Document("LangChain vs. LangGraph..."),
+#     Document("..."),
+#     Document("..."),
+#     Document("...")]
+```
+
+retriever 内部又分三步（对中间件不可见，但帮助你理解）：
+1. `embeddings.embed_query(standalone_query)` → 查询向量 `[0.023, -0.451, ...]`
+2. 与 Chroma 库中所有文档向量做余弦相似度计算
+3. 返回最相似的 4 个 Document
+
+---
+
+### 3.5 阶段 3：`create_retrieval_chain` 拼接数据
+
+```python
+# create_retrieval_chain 拿到子链1的结果后，自动拼装：
+qa_input = {
+    "input": "How is it different from LangGraph?",   # 原始用户问题（未改写！）
+    "chat_history": [HumanMessage(...), AIMessage(...)], # 原始历史
+    "context": [                                       # ★ 子链1的输出，被放到 context 字段
+        Document("LangChain vs. LangGraph vs. Deep Agents\nUse LangGraph..."),
+        Document("..."),
+        Document("..."),
+        Document("..."),
+    ],
+}
+# 注意：input 是原始用户问题，不是改写后的查询。
+# 改写后的查询只用于检索（retriever.invoke），用户看到的还是原始问题。
+```
+
+---
+
+### 3.6 阶段 4：子链2 — QA 链把文档"喂"给 LLM
+
+子链2 由 `create_stuff_documents_chain` 创建，内部做三件事。
+
+#### Step 4a：拼接 Document 列表为字符串
+
+```python
+# create_stuff_documents_chain 内部（框架代码，简化）
+# 把 List[Document] 变成一段连续的文本
+
+# 每个 Document 转成文本：page_content
+# 多个 Document 之间用 "\n\n" 分隔（默认 separator）
+context_str = "\n\n".join(doc.page_content for doc in qa_input["context"])
+# → "LangChain vs. LangGraph vs. Deep Agents\n\nUse LangGraph, our low-level
+#    orchestration framework, for advanced needs combining deterministic and
+#    agentic workflows. Deep Agents build on LangChain's agents..."
+
+# 然后填入 {context} 变量
+```
+
+**为什么用 `create_stuff_documents_chain` 而不是手写拼接？** 因为它在拼接之前还做了 Token 限制检查、文档排序、分隔符统一——手写容易漏掉边界条件。
+
+#### Step 4b：填 QA Prompt
+
+```python
+# qa_prompt 是一个 ChatPromptTemplate：
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a knowledgeable AI assistant. Answer based STRICTLY "
+               "on the following retrieved context.\n\n"
+               "Rules:\n"
+               "1. If the context contains the answer, answer based on it.\n"
+               "2. If it does NOT, say: '当前知识库中没有相关信息。'\n\n"
+               "## Retrieved Context\n{context}"),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+# .invoke() 时：
+#   1. {context} → 替换为 Step 4a 拼接好的文档字符串
+#   2. {input} → 替换为原始用户问题
+#   3. MessagesPlaceholder("chat_history") → 展开为历史消息
+filled_qa_prompt = qa_prompt.invoke(qa_input)
+```
+
+填入后 LLM 实际收到的 Prompt：
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ SystemMessage:                                                │
+│   "You are a knowledgeable AI assistant. Answer based         │
+│    STRICTLY on the following retrieved context.               │
+│    ## Retrieved Context                                       │
+│    LangChain vs. LangGraph vs. Deep Agents                    │
+│    Use LangGraph, our low-level orchestration framework..."   │
+│                                                              │
+│ HumanMessage: "What is LangChain?"          ← chat_history[0] │
+│ AIMessage:    "当前知识库中没有相关信息。"     ← chat_history[1] │
+│ HumanMessage: "How is it different from     ← {input} 填入    │
+│                LangGraph?"                                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**注意**：子链2 的 Prompt 中有 `{context}`（检索到的文档），子链1 的 Prompt 中没有——这就是两个子链的核心区别。子链1 只负责"找文档"，子链2 负责"基于文档回答"。
+
+#### Step 4c：LLM 生成最终回答
+
+```python
+# qa_chain 内部（框架代码，简化）
+final_response = llm.invoke(filled_qa_prompt)
+# → AIMessage(content="LangChain 是一个高级框架，LangGraph 是低级编排框架。
+#        LangChain 的代理实际上构建在 LangGraph 之上，继承了其持久化执行、
+#        人机协同等特性。简而言之，LangGraph 更底层更强大，LangChain 是
+#        在其之上构建的更简洁的接口。")
+
+# qa_chain 返回的是纯字符串（内部已经过 StrOutputParser）
+# 但 rag_chain（create_retrieval_chain）返回的是完整的 dict：
+```
+
+---
+
+### 3.7 阶段 5：`RunnableWithMessageHistory` 追加新消息
+
+`rag_chain` 执行完毕，返回 dict 给 `RunnableWithMessageHistory`：
+
+```python
+# rag_chain 的返回值（由 create_retrieval_chain 包装后）：
+rag_output = {
+    "input": "How is it different from LangGraph?",
+    "chat_history": [HumanMessage(...), AIMessage(...)],
+    "context": [Document(...), Document(...), Document(...), Document(...)],
+    "answer": "LangChain 是一个高级框架，LangGraph 是低级编排框架..."
+    # ↑ answer 字段是 create_retrieval_chain 从 qa_chain 的输出中提取的
+}
+```
+
+`RunnableWithMessageHistory` 拿到这个 dict 后，执行"调用后"逻辑：
+
+```python
+# === RunnableWithMessageHistory.invoke() 的"调用后"逻辑（框架代码，简化）===
+
+# 第 1 步：从输出中提取用户问题和 AI 回答
+user_input = rag_output["input"]
+# → "How is it different from LangGraph?"
+ai_answer = rag_output["answer"]  # ← output_messages_key="answer" 指定的字段
+# → "LangChain 是一个高级框架..."
+
+# 第 2 步：把本轮对话追加到历史
+history.add_message(HumanMessage(user_input))   # 追加用户问题
+history.add_message(AIMessage(ai_answer))       # 追加 AI 回答
+
+# 第 3 步：返回给用户（rag_output 原样透传）
+return rag_output
+```
+
+**此时 `store["session_1"]` 的内容**：
+
+```python
+# 两轮对话后，store["session_1"].messages 变成 4 条：
+[
+    HumanMessage("What is LangChain?"),                    # 第1轮用户
+    AIMessage("当前知识库中没有相关信息。"),                   # 第1轮AI
+    HumanMessage("How is it different from LangGraph?"),   # 第2轮用户
+    AIMessage("LangChain 是一个高级框架，LangGraph 是低级编排框架..."),  # 第2轮AI
+]
+```
+
+**下一次**同一 `session_id` 的调用会从 Step 3.2 开始，`history.messages` 就有 4 条了——LLM 能看到完整的对话上下文。
+
+---
+
+### 3.8 完整调用栈（一次 `invoke` 内发生了什么）
+
+```
+用户代码：
+  conversational_rag_chain.invoke(
+      {"input": "How is it different from LangGraph?"},
+      config={"configurable": {"session_id": "session_1"}}
+  )
+        │
+        ▼
+┌─ RunnableWithMessageHistory.invoke() ──────────────────────┐
+│  [Before] get_session_history("session_1")                  │
+│           → history.messages = [HumanMsg, AIMsg]           │
+│  [Before] 拼装 chain_input = {input, chat_history}         │
+│                                                            │
+│  ┌─ rag_chain.invoke(chain_input) ─────────────────────┐  │
+│  │                                                      │  │
+│  │  ┌─ history_aware_retriever.invoke() ────────────┐  │  │
+│  │  │  ① contextualize_prompt.invoke() 填模板        │  │  │
+│  │  │  ② llm.invoke(填好的Prompt) → "How is         │  │  │
+│  │  │     LangChain different from LangGraph?"       │  │  │
+│  │  │  ③ retriever.invoke(改写后的查询)              │  │  │
+│  │  │     → [Document, Document, Document, Document] │  │  │
+│  │  └────────────────────────────────────────────────┘  │  │
+│  │                      │                                 │  │
+│  │  create_retrieval_chain 拼接 context 字段              │  │
+│  │                      │                                 │  │
+│  │  ┌─ qa_chain.invoke() ────────────────────────────┐  │  │
+│  │  │  ① 拼接 Document → 字符串                       │  │  │
+│  │  │  ② qa_prompt.invoke() 填 {context}+{input}     │  │  │
+│  │  │  ③ llm.invoke(填好的Prompt)                    │  │  │
+│  │  │     → AIMessage("LangChain 是一个高级框架...")  │  │  │
+│  │  └────────────────────────────────────────────────┘  │  │
+│  │                      │                                 │  │
+│  │  返回 {input, chat_history, context, answer}          │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                            │
+│  [After] history.add_message(HumanMsg)                     │
+│  [After] history.add_message(AIMsg)                        │
+│  返回 rag_output 给用户                                     │
+└────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 五、完整时序图
 
 ```
 时间 ──────────────────────────────────────────────────────────→
@@ -1286,7 +1869,7 @@ RunnableWithMessageHistory
 
 ---
 
-## 五、MessagesPlaceholder 的执行细节
+## 六、MessagesPlaceholder 的执行细节
 
 这是最容易困惑的地方，展开说：
 
@@ -1324,7 +1907,7 @@ prompt = ChatPromptTemplate.from_messages([
 
 ---
 
-## 六、Messages 在设计中的位置
+## 七、Messages 在设计中的位置
 
 ```
 输入/输出层          Messages 是这里的主角
@@ -1814,83 +2397,269 @@ for block in blocks:
 
 ## 五、典型输出场景
 
-### 场景 1：带思考过程的回答（DeepSeek-R1 / Claude Thinking）
+这一节用四个真实场景展示 ContentBlock 能做什么——从 AI 回复中精确提取"思考过程""图片""工具调用""引用来源"。
+
+### 场景 1：带思考过程的回答
+
+**背景**：DeepSeek-R1、Claude Thinking 等推理模型在给出最终回答前，会先在内部推理（写在 `<think>` 标签或 `thinking` 字段中）。你通常只关心最终回答——但调试时需要看到思考过程。
+
+**模型返回的原始数据**（厂商各自不同）：
+
+```
+# DeepSeek-R1 的原始响应（简化）：
+"content": "好的，用户问的是量子纠缠。\n\n量子纠缠是指..."   
+"additional_kwargs": {"reasoning_content": "嗯，量子纠缠是量子力学的核心概念之一，用户可能想要一个通俗的解释..."}
+
+# Claude Thinking 的原始响应（简化）：
+"content": [
+    {"type": "thinking", "thinking": "这是量子力学核心概念，需要先铺垫..."}, 
+    {"type": "text", "text": "量子纠缠是指..."}
+]
+
+# ↑ 两个厂商的字段名、嵌套方式完全不同！
+# 如果直接解析原始 JSON，每个厂商要写一套代码。
+```
+
+**`content_blocks` 统一后的结果**（你的代码只处理一种格式）：
 
 ```python
-# 模型返回的原始 AIMessage
-ai_msg = llm.invoke("解释量子纠缠")
+# 调用模型
+ai_msg = llm.invoke("用通俗的语言解释量子纠缠")
 
-# content_blocks 会自动把 reasoning 提取为独立的 ReasoningContentBlock
+# 不管底层是 DeepSeek 还是 Claude，content_blocks 都是同一套格式：
 for block in ai_msg.content_blocks:
     print(f"[{block['type']}]")
 
-# 输出：
-# [reasoning]   ← ReasoningContentBlock: 模型的推理过程
-# [text]        ← TextContentBlock: 模型的实际回答
+# 输出（DeepSeek-R1 或 Claude Thinking 都这样）：
+# [reasoning]   ← 模型的思考过程（自动从 <think> 或 thinking 字段提取）
+# [text]        ← 模型给用户的最终回答
 ```
 
-对应代码获取：
+**data 长什么样**——遍历每一个 block，看看里面的实际字段：
 
 ```python
-# 只拿文本回答
+for block in ai_msg.content_blocks:
+    match block["type"]:
+        case "reasoning":
+            # ReasoningContentBlock 的结构：
+            # {
+            #     "type": "reasoning",
+            #     "id": "lc_abc123...",          ← 框架自动生成的唯一 ID
+            #     "reasoning": "嗯，用户想要通俗解释。量子纠缠的核心是..."  ← 思考全文
+            # }
+            print(f"🧠 思考过程: {block['reasoning'][:80]}...")
+
+        case "text":
+            # TextContentBlock 的结构：
+            # {
+            #     "type": "text",
+            #     "id": "lc_def456...",
+            #     "text": "量子纠缠指的是两个粒子无论相隔多远..."  ← 最终回答全文
+            #     "annotations": [...]  ← 可能有引用标记（见场景4）
+            # }
+            print(f"💬 最终回答: {block['text'][:80]}...")
+```
+
+**为什么思考过程被单独抽出来？** 因为 `content` 字段直接给用户看（聊天 UI），而 `reasoning` 你已经通过 `content_blocks` 拿到了——不需要去解析 DeepSeek 的 `additional_kwargs` 或 Claude 的 `thinking` 块。
+
+**如果你只想要文本，一行就够了**：
+
+```python
+# 提取纯文本回答（跳过思考过程）
 text = "".join(b["text"] for b in ai_msg.content_blocks if b["type"] == "text")
 
-# 只拿思考过程
+# 提取思考过程（调试用）
 reasoning = "".join(b["reasoning"] for b in ai_msg.content_blocks if b["type"] == "reasoning")
 
-# 拿工具调用
+# 提取工具调用请求
 tool_calls = [b for b in ai_msg.content_blocks if b["type"] == "tool_call"]
 ```
 
-### 场景 2：多模态输入（图片 + 文本）
+---
+
+### 场景 2：多模态输入 — 让 LLM"看图说话"
+
+**背景**：你想让 LLM 分析一张图片，需要把图片和文字说明一起发给模型。不同厂商传图片的方式完全不同。
+
+**你用 ContentBlock 构造一条消息**（厂商无关）：
 
 ```python
+from langchain_core.messages import HumanMessage
 from langchain_core.messages.content import create_text_block, create_image_block
 
-# 构造一条多模态消息
+# 一条消息 = 文字块 + 图片块，顺序就是你写的顺序
 msg = HumanMessage(content=[
-    create_text_block("描述这张图片的内容："),
+    create_text_block("描述这张图片里的内容："),
     create_image_block(
-        url="https://example.com/photo.jpg",
-        mime_type="image/jpeg",
+        url="https://example.com/architecture_diagram.png",
+        mime_type="image/png",
     ),
 ])
 
-# llm.invoke([msg]) 时：
-# → block_translator 把标准 ContentBlock 转为厂商格式
-# → OpenAI: [{type: text, text: ...}, {type: image_url, image_url: {url: ...}}]
-# → Anthropic: [{type: text, text: ...}, {type: image, source: {type: url, url: ...}}]
-response = llm.invoke([msg])
+# 这条消息在代码里的实际结构：
+# [
+#     {"type": "text",  "id": "lc_001", "text": "描述这张图片里的内容："},
+#     {"type": "image", "id": "lc_002", "url": "https://...", "mime_type": "image/png"},
+# ]
 ```
 
-### 场景 3：工具调用 + 流式
+**block_translator 把统一格式转为厂商格式**（你不需要写这段，框架自动做）：
+
+```python
+# 当 llm.invoke([msg]) 时，ChatOpenAI 内部调用：
+# _convert_from_v1_to_chat_completions(msg)
+
+# 你的 ContentBlock（统一格式）→ 转为 OpenAI 格式：
+# [
+#     {"type": "text", "text": "描述这张图片里的内容："},
+#     {"type": "image_url", "image_url": {"url": "https://...", "detail": "auto"}},
+# ]
+
+# 如果是 Anthropic 模型，同样的 ContentBlock 转为 Anthropic 格式：
+# [
+#     {"type": "text", "text": "描述这张图片里的内容："},
+#     {"type": "image", "source": {"type": "url", "url": "https://...", "media_type": "image/png"}},
+# ]
+```
+
+**三种传图方式一视同仁**：
+
+```python
+# 方式 1：URL（远程图片）
+create_image_block(url="https://example.com/photo.jpg", mime_type="image/jpeg")
+
+# 方式 2：Base64（本地图片，把文件读成 base64 字符串）
+import base64
+with open("local_photo.jpg", "rb") as f:
+    b64_data = base64.b64encode(f.read()).decode()
+create_image_block(base64=b64_data, mime_type="image/jpeg")
+
+# 方式 3：File ID（先上传到 OpenAI/Anthropic 的 Files API，用返回的 file_id）
+create_image_block(file_id="file-abc123")
+```
+
+**完整调用**：
+
+```python
+response = llm.invoke([msg])
+# → AIMessage(content="这张架构图展示了微服务之间的调用关系：API Gateway 连接了...")
+
+# 如果 LLM 返回的回复中也包含图片（如生成图表），同样可以从 content_blocks 读取：
+for block in response.content_blocks:
+    if block["type"] == "image":
+        save_image(block["url"])  # 保存生成的图片
+    elif block["type"] == "text":
+        print(block["text"])      # 打印文字说明
+```
+
+---
+
+### 场景 3：工具调用 + 流式 — 边生成边识别 tool_calls
+
+**背景**：LLM 在流式输出时，可能在中途决定调用工具。`content_blocks` 能让你在流式过程中区分"这是文字 token"还是"这是工具调用的参数片段"。
+
+**先理解：流式中 ContentBlock 的两种类型**
+
+流式输出时，content_blocks 中的类型不是 `text` 就是 `tool_call_chunk`：
 
 ```python
 llm_with_tools = llm.bind_tools([get_weather])
 
-# 流式调用
-for chunk in llm_with_tools.stream("北京天气怎么样？"):
+# chunk 是 AIMessageChunk（流式片段），每个 chunk 包含若干 content_blocks
+for chunk in llm_with_tools.stream("北京今天天气怎么样？适合户外运动吗？"):
     for block in chunk.content_blocks:
-        if block["type"] == "text":
-            print(block["text"], end="", flush=True)
-        elif block["type"] == "tool_call_chunk":
-            print(f"\n[正在调用工具: {block['name']}]")
+        match block["type"]:
+            case "text":
+                # 正常的文字 token。流式过程中逐字返回。
+                # block = {"type": "text", "text": "北"}  ← 第一个 token
+                # block = {"type": "text", "text": "京"}  ← 第二个 token
+                # block = {"type": "text", "text": "今"}  ← ...
+                print(block["text"], end="", flush=True)
+
+            case "tool_call_chunk":
+                # 工具调用的参数片段。流式过程中逐字段返回。
+                # block = {"type": "tool_call_chunk", "name": "get_weather", "id": "call_1", "args": ""}
+                # block = {"type": "tool_call_chunk", "args": "{\"city\": \"北京\"}"}
+                # 所有 chunk 累加后 → 完整 ToolCall
+                print(f"\n 🔧 正在准备工具调用: {block.get('name', '?')}...")
 ```
 
-### 场景 4：引用/注释
+**流式输出的完整时间线**（某个真实时刻的状态）：
+
+```
+时间 →
+
+chunk 1:  AIMessageChunk(content_blocks=[{"type": "text", "text": "我来"}])
+chunk 2:  AIMessageChunk(content_blocks=[{"type": "text", "text": "查一下"}])
+chunk 3:  AIMessageChunk(content_blocks=[{"type": "text", "text": "天气"}])
+  ↓ LLM 意识到需要调工具了
+chunk 4:  AIMessageChunk(content_blocks=[{"type": "tool_call_chunk", "name": "get_weather", "id": "call_1", "args": ""}])
+chunk 5:  AIMessageChunk(content_blocks=[{"type": "tool_call_chunk", "args": "{\"city\": \"北京\"}"}])
+  ↓ 工具调用参数传输完毕
+chunk 6:  AIMessageChunk(content_blocks=[])  ← 空块，流式结束
+```
+
+**`tool_call` vs `tool_call_chunk`**：
+
+| | `tool_call`（完整） | `tool_call_chunk`（流式片段） |
+|---|---|---|
+| 出现时机 | 非流式调用 `invoke()` 后 | 流式调用 `stream()` 过程中 |
+| 内容 | 完整的 `{"name": ..., "args": {...}, "id": "..."}` | 逐个字段累加的片段 |
+| 可执行？ | 是，直接传给 Tool | 否，需要等待全部 chunk 合并 |
+
+**合并规则**：同名 + 同 index 的 chunk 自动累加——`name="get"` + `name="_weather"` = `name="get_weather"`。这是 AIMessageChunk 的 `+` 运算符内置的。
+
+---
+
+### 场景 4：引用与注释 — 知道 AI 的回答来自哪里
+
+**背景**：LLM（特别是 Anthropic Claude + 网页检索）可以标注回答的每个段落引用了哪个来源。`content_blocks` 把这些引用以 annotation 形式附在 text 块上。
+
+**一条带引用的回复长什么样**：
 
 ```python
-# OpenAI 和 Anthropic 都可以返回引用
-ai_msg = llm.invoke("LangChain 的主要特点是什么？")
+ai_msg = llm.invoke("根据 LangChain 文档，框架的核心组件有哪些？")
 
 for block in ai_msg.content_blocks:
-    if block["type"] == "text":
-        print(block["text"])
-        # 该文本块可能带注释
-        for ann in block.get("annotations", []):
-            if ann["type"] == "citation":
-                print(f"  ↑ 引用自: {ann.get('url', 'N/A')}")
+    if block["type"] != "text":
+        continue
+
+    # 打印文本
+    print(f"💬 {block['text']}")
+
+    # 检查这段文本有没有引用标记
+    annotations = block.get("annotations", [])
+    for ann in annotations:
+        if ann["type"] == "citation":
+            # Citation 的结构：
+            # {
+            #     "type": "citation",
+            #     "id": "lc_cite001",
+            #     "url": "https://docs.langchain.com/oss/python/overview",
+            #     "title": "LangChain Overview",
+            #     "start_index": 12,      ← 引用从回复文本的第 12 个字符开始
+            #     "end_index": 35,        ← 到第 35 个字符结束
+            #     "cited_text": "LangChain provides modular core components"
+            # }
+            cited_part = block["text"][ann["start_index"]:ann["end_index"]]
+            print(f"  ↑「{cited_part}」引用自: {ann.get('url', 'N/A')}")
 ```
+
+**实际输出效果**（在聊天 UI 中的渲染）：
+
+```
+💬 LangChain 的核心组件包括 Models、Messages、Tools、Agents 和 Middleware。
+
+  ↑「Models、Messages、Tools、Agents 和 Middleware」引用自: https://docs.langchain.com/oss/python/overview
+
+💬 其中 Middleware 是 1.0 版本引入的新特性...
+
+  ↑「Middleware 是 1.0 版本引入」引用自: https://docs.langchain.com/oss/python/middleware
+```
+
+**`start_index` / `end_index` 指的是什么？** 它们指向的是 **LLM 的回复文本**，不是原始文档。所以 `start_index=12, end_index=35` 表示"当前 text 块的第 12~35 个字符引用了那个来源"。这样前端可以精确高亮被引用的文字。
+
+**哪些模型支持引用？** Anthropic Claude（原生 citations）、OpenAI（通过 response_format + web_search 产生）、Google Gemini（grounding metadata → 转为 citation）。不同厂商的引用格式各异，但 `content_blocks` 把它们统一为 `Citation`。
 
 ## 六、`extras` 字段 — 厂商特性不丢失
 

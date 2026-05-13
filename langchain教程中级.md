@@ -98,45 +98,283 @@ translate_tool = StructuredTool.from_function(
 )
 ```
 
-### 1.4 方式三：继承 BaseTool（完全控制）
+### 1.4 方式三：继承 BaseTool（完全控制 — 面向对象的方式）
 
-**需要内部状态、自定义流式逻辑、或实现非标准工具时用。** 给最大控制权。
+#### 什么时候需要继承 BaseTool
+
+前两种方式的本质都是"把一个函数包成 Tool"。但有些场景函数做不到：
+
+```
+场景 A：工具需要**内部状态**（计数器、连接池、缓存）
+  @tool 是函数，函数无状态。每次调用都是全新的，不能"记住上一次"。
+
+场景 B：工具需要**控制流式输出**（逐块返回结果，而非一次性返回）
+  @tool 函数只返回一个 str，框架帮你处理流式。但如果你想要自定义流式行为，必须继承。
+
+场景 C：工具需要在**调用前后加钩子**（如鉴权、日志、参数校验）
+  函数只有一行逻辑，没有 pre/post 钩子可以挂载。
+
+场景 D：工具是**一个复杂的类**（从 Java 迁移过来的 Service、Repository 等）
+  直接继承 BaseTool 比先函数化再 @tool 更自然。
+```
+
+#### 类图：BaseTool 的继承链
+
+```
+Runnable                ← 所有组件的基类（invoke/batch/stream）
+   └─ BaseTool           ← 工具的抽象基类，定义了工具契约
+        │
+        │ 你必须重写的：
+        │   _run(input) → str              同步执行逻辑
+        │
+        │ 你可选重写的：
+        │   _arun(input) → str             异步执行逻辑
+        │   _stream(input) → Iterator[str]  自定义流式输出
+        │
+        │ 你必须声明的（类属性）：
+        │   name: str                      工具名（LLM 用这个名称调用）
+        │   description: str               工具描述（LLM 据此判断何时调用）
+        │   args_schema: BaseModel          参数 Schema（LLM 知道要传什么参数）
+        │
+        │ 你可以添加的：
+        │   自定义实例属性（计数器、连接池、缓存、配置...）
+        │   自定义方法（辅助函数、校验逻辑、钩子...）
+        │
+        ▼
+   你的 CalculatorTool / DatabaseTool / WeatherTool ...
+```
+
+#### 完整实战：一个"可观测的"数据库查询工具
+
+这个例子展示继承 BaseTool 的真正威力——不是简单计算，而是一个有连接池、计数器、日志、慢查询告警的生产级工具。
 
 ```python
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
+from typing import Literal
+import time, logging
 
-class CalculatorInput(BaseModel):
-    expression: str = Field(description="数学表达式，如 '2 + 3 * 4'")
+logger = logging.getLogger(__name__)
 
-class CalculatorTool(BaseTool):
-    """一个带调用计数器的计算器。"""
+# ================================================================
+# 第 1 步：定义参数 Schema（与 @tool 的 args_schema 完全一样）
+# ================================================================
+class DatabaseQueryInput(BaseModel):
+    """
+    数据库查询工具的输入参数。
 
-    name: str = "calculator"
-    description: str = "计算数学表达式。支持加减乘除、幂运算。"
-    args_schema: type[BaseModel] = CalculatorInput
+    这个 Schema 会被 LangChain 自动转为 LLM 看得懂的 JSON Schema。
+    每个 Field 的 description 帮助 LLM 理解：这个参数是干什么的、取值范围是什么。
+    """
+    sql: str = Field(
+        description="要执行的 SQL 查询语句。仅支持 SELECT，禁止 INSERT/UPDATE/DELETE",
+        min_length=1,
+        max_length=2000,
+    )
+    limit: int = Field(
+        default=100,
+        description="返回结果的最大行数",
+        ge=1,      # ≥ 1
+        le=1000,   # ≤ 1000
+    )
 
-    # 内部状态：实例变量
-    call_count: int = 0
 
-    def _run(self, expression: str) -> str:
-        """同步执行"""
-        self.call_count += 1
+# ================================================================
+# 第 2 步：继承 BaseTool，实现工具类
+# ================================================================
+class DatabaseQueryTool(BaseTool):
+    """
+    安全的数据库查询工具。
+
+    这个类展示了继承 BaseTool 的完整能力：
+    ┌─────────────────────────────────────────────┐
+    │ 类属性（必须声明）                              │
+    │   name / description / args_schema           │
+    │                                              │
+    │ 实例属性（自定义状态）                          │
+    │   connection_pool : 数据库连接池（复用连接）     │
+    │   query_count     : 本实例累计执行的查询次数     │
+    │   slow_query_threshold : 慢查询阈值（秒）       │
+    │                                              │
+    │ 必须重写的方法                                  │
+    │   _run(input) → str                          │
+    │                                              │
+    │ 可选重写的方法                                  │
+    │   _arun(input) → str   (异步版)               │
+    │                                              │
+    │ 自定义方法                                     │
+    │   _check_sql_safety : SQL 安全检查             │
+    │   _log_query        : 查询日志记录             │
+    │   _maybe_warn_slow  : 慢查询告警               │
+    └─────────────────────────────────────────────┘
+    """
+
+    # ===== 必须声明的 3 个类属性 =====
+    # 这些属性替代了 @tool 的自动推导
+    name: str = "query_database"
+    description: str = (
+        "在数据库中执行只读 SQL 查询。"
+        "仅支持 SELECT 语句。"
+        "返回 CSV 格式的前 N 行结果。"
+        "如果查询超时或语法错误，返回错误信息。"
+    )
+    args_schema: type[BaseModel] = DatabaseQueryInput
+
+    # ===== 自定义实例属性（@tool 做不到的）=====
+    # 这些属性在 __init__ 中初始化，整个实例生命周期内保持
+
+    connection_pool: object = None      # 数据库连接池（真实项目用 SQLAlchemy）
+    query_count: int = 0                # 累计查询次数（内部计数器）
+    slow_query_threshold: float = 3.0   # 慢查询阈值（秒），超过就打 WARN 日志
+
+    # ===== 必须重写：同步执行逻辑 =====
+    def _run(self, sql: str, limit: int = 100) -> str:
+        """
+        执行 SQL 查询。
+
+        这是 BaseTool 要求子类实现的**唯一必须方法**。
+        框架调用 invoke() → 框架做参数校验 → _run() → 框架包装返回值。
+
+        参数：
+          sql   : LLM 传入的 SQL 语句（由 args_schema 自动校验）
+          limit : LLM 传入的行数限制（默认 100）
+
+        返回值：
+          str : 给 LLM 看的查询结果（LLM 会把这个结果放入上下文继续推理）
+        """
+        # ---- 步骤 1：调用前置钩子（安全校验）----
+        # 这些逻辑在 @tool 函数里也可以写，但放在类方法中更清晰
+        error_msg = self._check_sql_safety(sql)
+        if error_msg:
+            return f"❌ SQL 安全检查失败: {error_msg}"
+
+        # ---- 步骤 2：执行查询 + 计时 ----
+        self.query_count += 1       # 累加计数器（实例状态！）
+        start = time.monotonic()
+
         try:
-            result = eval(expression, {"__builtins__": {}}, {})
-            return f"结果: {result} (第{self.call_count}次调用)"
+            # 模拟数据库查询（生产环境替换为真实的 connection_pool.execute）
+            results = self._execute_sql(sql, limit)
+
+            # ---- 步骤 3：调用后置钩子（日志 + 告警）----
+            elapsed = time.monotonic() - start
+            self._log_query(sql, elapsed, len(results))
+            self._maybe_warn_slow(sql, elapsed)
+
+            # ---- 步骤 4：格式化返回结果 ----
+            if not results:
+                return "查询成功，但没有匹配的记录。"
+            return f"查询成功（{elapsed:.2f}s），返回 {len(results)} 行:\n" + results
+
         except Exception as e:
-            return f"计算错误: {e}"
+            elapsed = time.monotonic() - start
+            logger.error(f"[query_database] 查询失败 (耗时 {elapsed:.2f}s): {e}")
+            # 返回自然语言错误（不是 traceback），以便 LLM 理解并调整
+            return f"❌ 查询执行失败: {e}。请检查 SQL 语法后重试。"
 
-    # 可选：异步执行
-    async def _arun(self, expression: str) -> str:
-        return self._run(expression)  # 简单转发
+    # ===== 可选重写：异步执行 =====
+    async def _arun(self, sql: str, limit: int = 100) -> str:
+        """
+        异步版执行逻辑。
 
-# 使用
-calc = CalculatorTool()
-calc.invoke({"expression": "2 + 3 * 4"})  # → "结果: 14 (第1次调用)"
-calc.invoke({"expression": "10 / 2"})     # → "结果: 5.0 (第2次调用)"
-print(calc.call_count)                     # → 2  ← 内部状态保持
+        为什么需要单独实现？
+          _run 是同步的 → 在 asyncio 事件循环中会阻塞。
+          _arun 是异步的 → 在等待数据库响应时让出控制权，不阻塞其他协程。
+
+        当前简单转发给 _run（生产环境应改为真正的 async DB driver）。
+        """
+        return self._run(sql, limit)
+
+    # ===== 自定义私有方法：安全检查 =====
+    def _check_sql_safety(self, sql: str) -> str | None:
+        """
+        检查 SQL 是否安全。
+
+        返回 None = 安全，返回 str = 错误信息（会阻止执行）。
+
+        为什么放在工具内部而不是外部中间件？
+          这个检查是此工具特有的——只有 database 类工具需要 SQL 安全检查。
+          外部中间件是"横切关注点"，内部校验是"业务规则"。
+        """
+        sql_upper = sql.upper().strip()
+
+        # 禁止写操作（这个工具只读）
+        dangerous_keywords = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE"]
+        for keyword in dangerous_keywords:
+            if sql_upper.startswith(keyword):
+                return f"禁止执行 {keyword} 操作。此工具仅支持 SELECT 查询。"
+
+        # 禁止多语句查询（防注入）
+        if ";" in sql.rstrip(";"):   # 允许末尾有一个分号
+            return "禁止执行多条 SQL 语句。"
+
+        return None   # 通过校验
+
+    # ===== 自定义私有方法：日志 =====
+    def _log_query(self, sql: str, elapsed: float, row_count: int):
+        """记录查询日志。"""
+        logger.info(
+            f"[query_database] SQL: {sql[:80]} | "
+            f"耗时: {elapsed:.3f}s | 结果: {row_count}行 | "
+            f"累计: 第{self.query_count}次查询"
+        )
+
+    # ===== 自定义私有方法：告警 =====
+    def _maybe_warn_slow(self, sql: str, elapsed: float):
+        """慢查询告警。"""
+        if elapsed > self.slow_query_threshold:
+            logger.warning(
+                f"⚠️ 慢查询告警: {elapsed:.2f}s (阈值: {self.slow_query_threshold}s) "
+                f"SQL: {sql[:100]}"
+            )
+
+    # ===== 私有辅助方法 =====
+    def _execute_sql(self, sql: str, limit: int) -> str:
+        """模拟数据库查询。生产环境替换为真实数据库调用。"""
+        # 这里用真实数据库连接池：
+        # with self.connection_pool.acquire() as conn:
+        #     cursor = conn.execute(sql)
+        #     rows = cursor.fetchmany(limit)
+        return "模拟结果: id=1, name=Alice\n模拟结果: id=2, name=Bob"
+
+
+# ================================================================
+# 第 3 步：使用 —— 和 @tool 完全一样
+# ================================================================
+
+# 实例化（可以传构造函数参数，如真实的连接池）
+db_tool = DatabaseQueryTool(
+    slow_query_threshold=2.0,   # 覆盖默认的 3.0 秒
+)
+
+# LLM 看到的是 name/description/args_schema，不知道里面有连接池和计数器
+agent = create_agent(llm=llm, tools=[db_tool])
+
+# 第一次调用 — 状态在实例内部自动累加
+r1 = db_tool.invoke({"sql": "SELECT * FROM users WHERE active=1", "limit": 50})
+print(f"查询次数: {db_tool.query_count}")  # → 1
+
+# 第二次调用 — 同一个实例，计数器累加
+r2 = db_tool.invoke({"sql": "SELECT * FROM orders WHERE amount > 100", "limit": 10})
+print(f"查询次数: {db_tool.query_count}")  # → 2
+
+# 危险操作 — SQL 安全检查自动拦截
+r3 = db_tool.invoke({"sql": "DELETE FROM users WHERE id=1"})
+# → "❌ SQL 安全检查失败: 禁止执行 DELETE 操作。此工具仅支持 SELECT 查询。"
+```
+
+#### 三种实现方法的关系
+
+不管哪种方式，最终都实现了 `Runnable` 协议。LLM 看到的都是 `name + description + args_schema`，不知道内部是用 `@tool` 还是 `BaseTool`：
+
+```
+@tool            →  框架自动包装为  →  BaseTool 子类
+StructuredTool   →  框架自动包装为  →  BaseTool 子类
+继承 BaseTool    →  你手动定义     →  BaseTool 子类
+                        │
+                        ▼
+                  都是 Runnable
+              LLM 无差别调用
 ```
 
 ### 1.5 三种方式对比
@@ -146,17 +384,26 @@ print(calc.call_count)                     # → 2  ← 内部状态保持
 | 代码量 | 最少（3 行） | 中等 | 最多 |
 | 自动推导 name/description/schema | 是 | 需手动指定 | 需手动指定 |
 | 支持异步 | 是（async def） | 是（coroutine 参数） | 是（`_arun` 方法） |
-| 支持内部状态 | 否 | 否 | 是 |
+| 支持内部状态 | 否 | 否 | 是（实例属性） |
 | 从现有 Runnable 构建 | 否 | 是 | 需要额外代码 |
-| 自定义流式逻辑 | 否 | 否 | 是 |
-| 适用 | **99% 的场景** | 包装已有组件 | 需要状态/非标准行为 |
+| 自定义流式逻辑 | 否 | 否 | 是（`_stream` 方法） |
+| 生命周期钩子（pre/post） | 否 | 否 | 是（重写 `_run` 前后加逻辑） |
+| 面向对象设计 | 否（函数式） | 半（函数 + 参数） | 是（完整的类） |
+| 适用 | **99% 的场景** | 包装已有组件 | 需要状态/流式/复杂逻辑 |
 
-**选择指南**：
+**选择指南**（结合实际场景）：
 
 ```
-函数就是工具                    → @tool
-Chain/Pipeline 想当成工具用     → StructuredTool.from_function
-工具需要计数器/状态/自定义流式    → 继承 BaseTool
+函数就是工具                          → @tool
+  "我有一个 get_weather 函数，想让它被 LLM 调"
+  
+一个已有的 Chain 想当成工具用           → StructuredTool.from_function
+  "我已经写了一个翻译 Pipeline，想直接给 Agent 用"
+  
+工具需要计数器/连接池/缓存/流式/钩子     → 继承 BaseTool
+  "我的数据库工具需要连接池复用、慢查询告警、调用计数"
+  "我的文件工具需要断点续传进度"
+  "从 Java Service 迁移过来的类，继承比包装更自然"
 ```
 
 ---
@@ -682,257 +929,742 @@ Tool(
 )
 ```
 
-### 6.3 本地部署 MCP 服务（FastMCP + ClientSessionGroup）
+### 6.3 本地部署 MCP 服务 — 完整开发流程
 
-**Step 1：创建一个 MCP Server（提供工具的一方）**
+这一节从头搭建一个可运行的 MCP 本地环境：**你写一个 Server 提供工具，再写一个 Client 消费这些工具**。
+
+#### 6.3.1 架构总览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      你的开发机器                                │
+│                                                                 │
+│  ┌──────────────────────────┐    ┌──────────────────────────┐  │
+│  │  weather_server.py       │    │  agent_client.py         │  │
+│  │  (MCP Server — 提供方)    │    │  (MCP Client — 消费方)    │  │
+│  │                          │    │                          │  │
+│  │  FastMCP("Weather")      │    │  ClientSessionGroup      │  │
+│  │    ├─ get_weather()      │    │    ├─ connect(weather)    │  │
+│  │    └─ get_air_quality()  │    │    ├─ connect(file)       │  │
+│  │                          │    │    └─ 聚合所有工具          │  │
+│  │  mcp.run(stdio)          │    │                          │  │
+│  └──────────┬───────────────┘    │  MCPToolkit →            │  │
+│             │                    │  create_agent(tools)     │  │
+│             │   stdio 通信        └──────────────────────────┘  │
+│             └─────────→ stdin/stdout ← ──────────               │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**关键理解**：Server 和 Client 是**两个独立的 Python 进程**。Server 通过 stdio（标准输入输出）与 Client 通信。Client 启动 Server 进程，往它的 stdin 写 JSON-RPC 请求，从它的 stdout 读响应。
+
+#### 6.3.2 第一步：创建 MCP Server
 
 ```python
-# weather_server.py — 部署为本地 MCP 服务
+# ================================================================
+# weather_server.py — MCP Server（工具提供方）
+# 运行方式：python weather_server.py
+# 这个进程启动后，等待 Client 通过 stdio 发来 JSON-RPC 请求
+# ================================================================
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("Weather Service", port=8001)
+# === 1. 创建 FastMCP 实例 ===
+# FastMCP 是官方提供的高层封装，底层是 asyncio + JSON-RPC over stdio
+# 参数 name: 会在 MCP 协议的 initialize 响应中返回给 Client
+mcp = FastMCP("Weather Service")
+
+# === 2. 用 @mcp.tool() 装饰器注册工具 ===
+# 和 LangChain 的 @tool 几乎一样：函数名 → name，docstring → description
+# 区别：这些工具在 Client 端通过 MCP 协议发现和调用，不在当前进程执行
 
 @mcp.tool()
 def get_weather(city: str) -> str:
-    """获取指定城市的实时天气。返回温度、天气状况。"""
-    weather_db = {"北京": "晴，25°C", "上海": "多云，28°C"}
-    return weather_db.get(city, f"找不到 {city} 的天气数据")
+    """
+    获取指定城市的实时天气信息。
+
+    返回该城市的温度、天气状况。
+    支持全国主要城市，如 北京、上海、广州、深圳。
+    """
+    # 模拟天气数据库（生产环境换成真实 API 调用）
+    weather_db = {
+        "北京": "晴，25°C，湿度 40%，风力 2级",
+        "上海": "多云，28°C，湿度 65%，风力 3级",
+        "广州": "阵雨，30°C，湿度 80%，风力 1级",
+        "深圳": "晴转多云，29°C，湿度 70%，风力 2级",
+    }
+    return weather_db.get(city, f"未找到 {city} 的天气数据。支持的城市：{', '.join(weather_db.keys())}")
 
 @mcp.tool()
 def get_air_quality(city: str) -> str:
-    """获取指定城市的空气质量指数(AQI)。"""
-    return f"{city} AQI: 45, 级别：优"
+    """
+    获取指定城市的空气质量指数（AQI）和级别。
 
+    返回 AQI 数值和级别描述（优/良/轻度污染/中度污染/重度污染）。
+    """
+    aqi_db = {
+        "北京": "AQI 52，级别：良",
+        "上海": "AQI 45，级别：优",
+        "广州": "AQI 68，级别：良",
+        "深圳": "AQI 35，级别：优",
+    }
+    return aqi_db.get(city, f"未找到 {city} 的空气质量数据。")
+
+# === 3. 启动 Server ===
+# transport="stdio" 表示通过标准输入输出与 Client 通信
+# 这个调用会阻塞当前进程，等待 Client 连接
 if __name__ == "__main__":
-    mcp.run(transport="stdio")  # 以 stdio 方式运行
+    mcp.run(transport="stdio")
 ```
 
-**Step 2：客户端通过 ClientSessionGroup 连接多个 MCP Server**
+#### 6.3.3 第二步：创建 MCP Client
 
 ```python
-# agent_client.py — 使用 MCP 工具的一方
+# ================================================================
+# agent_client.py — MCP Client（工具消费方）
+# 运行方式：python agent_client.py
+# 这个进程启动 weather_server.py，通过 stdio 连接它，加载工具
+# ================================================================
 import asyncio
 from mcp import StdioServerParameters
 from mcp.client.session_group import ClientSessionGroup
 from langchain_mcp import MCPToolkit
 from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
 async def main():
-    # 配置多个 MCP 服务
+    # === 1. 配置要连接的 MCP Server 列表 ===
+    # 每个 StdioServerParameters 描述一个 MCP 服务的位置和启动方式
+    # command + args 一起构成启动该服务的命令行
+    # ClientSessionGroup 会自动执行这些命令，启动子进程，建立 stdio 连接
     servers = [
         StdioServerParameters(
-            command="python",
-            args=["weather_server.py"],       # 本地天气服务
+            command="python",                       # 用什么命令启动
+            args=["weather_server.py"],             # 传给命令的参数
+            # 等效于在终端执行: python weather_server.py
         ),
-        StdioServerParameters(
-            command="python",
-            args=["file_server.py"],          # 本地文件服务
-        ),
+        # 可以添加更多 MCP Server——都通过 stdio 连接
+        # StdioServerParameters(
+        #     command="python",
+        #     args=["file_server.py"],
+        # ),
     ]
 
-    # ClientSessionGroup：管理多个 MCP 连接，聚合所有工具
+    # === 2. 创建 ClientSessionGroup ===
+    # ClientSessionGroup 是管理多个 MCP 连接的容器。
+    # 它负责：
+    #   - 启动子进程（执行 command + args）
+    #   - 建立 stdio 双向通信
+    #   - 自动初始化 MCP 协议握手（initialize → initialized → list_tools）
+    #   - 聚合所有 Server 的工具列表
+    # async with 退出时自动关闭所有子进程
+
     async with ClientSessionGroup() as group:
+        # --- 2a. 连接所有 Server ---
+        # connect_to_server 内部做的事：
+        #   ① subprocess.Popen(server.command, server.args)  → 启动子进程
+        #   ② stdio_client(server)                            → 建立通信通道
+        #   ③ ClientSession(read_stream, write_stream)        → 创建会话
+        #   ④ session.initialize()                           → MCP 协议握手
+        #   ⑤ session.list_tools()                           → 获取工具列表
         for server in servers:
             await group.connect_to_server(server)
 
-        # 从所有连接的 MCP Server 获取工具
+        # --- 2b. 从所有 Server 加载工具 ---
+        # group._tools 是一个 dict: {ClientSession: [MCP Tool 对象列表]}
+        # MCPToolkit 把原始的 MCP Tool 转换为 LangChain BaseTool
+        # 这样就能直接传给 create_agent()
         all_tools = []
-        for session, tools in group._tools.items():
+        for session, mcp_tools in group._tools.items():
+            # MCPToolkit 包装了一个 ClientSession
+            # initialize() → 调用 session.list_tools() → 拿到工具列表
+            # get_tools() → 把 MCP Tool 转为 LangChain BaseTool
             toolkit = MCPToolkit(session=session)
-            await toolkit.initialize()
-            all_tools.extend(toolkit.get_tools())
+            await toolkit.initialize()       # 获取工具列表
+            all_tools.extend(toolkit.get_tools())  # 转为 LangChain 工具
 
-        # 同时定义本地 fallback 工具
-        from langchain.tools import tool
+        print(f"✅ 已加载 {len(all_tools)} 个 MCP 工具：")
+        for t in all_tools:
+            print(f"   • {t.name}: {t.description[:60]}...")
 
-        @tool
-        def local_weather(city: str) -> str:
-            """天气查询的本地 fallback。"""
-            return f"{city}（本地查询）：晴，22°C"
-
-        # 混编：MCP 工具 + 本地 fallback
+        # --- 2c. 创建 Agent ---
+        llm = ChatOpenAI(model="deepseek-v4-pro", temperature=0.7)
         agent = create_agent(
             llm=llm,
-            tools=all_tools + [local_weather],
-            system_prompt="你是助手。优先使用 MCP 工具，失败时用本地 fallback。",
+            tools=all_tools,
+            system_prompt="你是智能助手，可以使用天气查询工具。",
         )
 
+        # --- 2d. 测试调用 ---
         result = agent.invoke({
-            "messages": [HumanMessage("北京天气怎么样？空气质量如何？")]
+            "messages": [HumanMessage("北京今天天气怎么样？空气质量好吗？")]
         })
-        print(result["messages"][-1].content)
+        print(f"\n🤖 Agent 回答: {result['messages'][-1].content}")
 
+# 入口
 asyncio.run(main())
 ```
 
-### 6.4 MCP 失败时自动切换到本地方法
+#### 6.3.4 关键通信机制
+
+```
+┌──────────────┐                    ┌──────────────────┐
+│ agent_client │                    │ weather_server   │
+│  (父进程)     │                    │  (子进程)         │
+└──────┬───────┘                    └────────┬─────────┘
+       │                                     │
+       │  ① subprocess.Popen("python",       │
+       │     ["weather_server.py"])           │
+       │  ─────────────────────────────────→  │ 启动子进程
+       │                                     │
+       │  ② initialize 请求（JSON-RPC）        │
+       │  {"method":"initialize", ...}        │
+       │  ───────── stdin ──────────→         │
+       │                                     │
+       │  ③ initialize 响应                   │
+       │  {"result":{"serverInfo":...}}       │
+       │  ←──────── stdout ──────────         │
+       │                                     │
+       │  ④ list_tools 请求（JSON-RPC）        │
+       │  {"method":"tools/list"}             │
+       │  ───────── stdin ──────────→         │
+       │                                     │
+       │  ⑤ 工具列表                          │
+       │  {"tools":[{"name":"get_weather"},   │
+       │    {"name":"get_air_quality"}]}      │
+       │  ←──────── stdout ──────────         │
+       │                                     │
+       │  ⑥ Agent 调用 get_weather            │
+       │  {"method":"tools/call",             │
+       │   "params":{"name":"get_weather",    │
+       │   "arguments":{"city":"北京"}}}      │
+       │  ───────── stdin ──────────→         │
+       │                                     │
+       │  ⑦ 工具结果                          │
+       │  {"content":[{"text":"北京：晴..."}]} │
+       │  ←──────── stdout ──────────         │
+       │                                     │
+```
+
+**stdio 通信的本质**：Client 把 JSON-RPC 请求写入 Server 的 `stdin`，Server 把结果写入自己的 `stdout`，Client 从 Server 的 `stdout` 读取。整个过程对开发者透明——你只操作 `MCPToolkit` 返回的 LangChain 工具，底层通信由 MCP 协议栈处理。
+
+---
+
+### 6.4 MCP 失败时的自动降级策略
+
+#### 为什么需要降级
+
+MCP Server 是独立进程，可能因为各种原因不可用：
+
+```
+网络断开 → 远程 MCP Server 不可达
+子进程崩溃 → 本地 MCP Server 异常退出
+超时 → Server 响应太慢
+```
+
+如果 Agent 唯一依赖 MCP 工具，这些故障等于 Agent 瘫痪。降级策略让 Agent 在 MCP 故障时切换到本地备用实现。
+
+#### 降级包装器实现
 
 ```python
 from langchain_core.tools import StructuredTool
+from typing import Callable
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MCPWithFallback:
-    """包装 MCP 工具，调用失败时自动降级到本地 fallback。"""
+    """
+    MCP 工具降级包装器。
 
-    def __init__(self, mcp_tool, fallback_func):
+    设计思路：
+      try: MCP 工具（主路径）→ 功能完整、数据最新
+      except: 本地 fallback（备用路径）→ 功能降级但可用
+
+    类比：
+      微服务架构中的 Circuit Breaker（断路器）。
+      主服务挂了 → 自动切到本地缓存 / 兜底逻辑。
+    """
+
+    def __init__(
+        self,
+        mcp_tool,                       # MCP 工具（主路径）
+        fallback_func: Callable,        # 本地 fallback 函数（备用路径）
+        max_retries: int = 1,           # MCP 失败后重试次数
+    ):
         self.mcp_tool = mcp_tool
         self.fallback = fallback_func
+        self.max_retries = max_retries
+        self._failure_count = 0         # 累计失败次数（用于监控告警）
 
     def to_tool(self) -> StructuredTool:
-        async def _call(**kwargs):
-            try:
-                return await self.mcp_tool.ainvoke(kwargs)
-            except Exception as e:
-                # MCP 失败 → 自动切换到本地方法
-                return self.fallback(**kwargs)
+        """
+        生成一个包装后的 LangChain 工具。
 
+        返回的工具有三个特征：
+          1. 优先走 MCP 路径
+          2. MCP 连续失败 max_retries+1 次后自动切 fallback
+          3. 对调用方完全透明（Agent 不知道内部用了 MCP 还是 fallback）
+
+        生成的工具签名（name/description/args_schema）沿用 MCP 工具的定义，
+        所以 Agent 看到的是同一个工具，不知道底层有主备切换。
+        """
+        async def _call_with_fallback(**kwargs):
+            # === 尝试走 MCP 主路径 ===
+            for attempt in range(self.max_retries + 1):
+                try:
+                    result = await self.mcp_tool.ainvoke(kwargs)
+                    self._failure_count = 0  # 成功后重置计数器
+                    return result
+                except Exception as e:
+                    self._failure_count += 1
+                    logger.warning(
+                        f"[MCP降级] {self.mcp_tool.name} 第{attempt+1}次尝试失败: {e}"
+                    )
+                    if attempt < self.max_retries:
+                        continue  # 还有重试次数 → 重试
+                    # 重试耗尽 → 走 fallback
+
+            # ===  MCP 失败 → 自动切换 fallback ===
+            logger.warning(
+                f"[MCP降级] {self.mcp_tool.name} 已切换至本地 fallback "
+                f"（累计失败 {self._failure_count} 次）"
+            )
+            return self.fallback(**kwargs)
+
+        # 用 StructuredTool.from_function 生成 LangChain 工具
+        # args_schema 沿用 MCP 工具的定义 → Agent 看到同样的参数
         return StructuredTool.from_function(
-            coroutine=_call,
+            coroutine=_call_with_fallback,
             name=self.mcp_tool.name,
-            description=self.mcp_tool.description,
+            description=f"{self.mcp_tool.description}（注：当前可能运行在降级模式）",
             args_schema=self.mcp_tool.args_schema,
         )
 
-# 使用
-mcp_weather_tool = all_tools[0]      # MCP 天气工具
+    @property
+    def is_degraded(self) -> bool:
+        """当前是否处于降级模式（用于外部监控）。"""
+        return self._failure_count > 0
 
+
+# === 使用示例 ===
+# 从 ClientSessionGroup 拿到了原始的 MCP 工具
+mcp_weather_tool = all_tools[0]  # get_weather（MCP 版本）
+
+# 包装为带降级的工具
 safe_weather = MCPWithFallback(
-    mcp_weather_tool,
-    fallback_func=lambda city: f"{city}（本地fallback）：晴，22°C",
+    mcp_tool=mcp_weather_tool,
+    # fallback：本地静态数据（不需要网络，保证可用）
+    fallback_func=lambda city: (
+        f"{city}（本地降级模式）：数据暂不可用，"
+        f"建议稍后重试或联系管理员。"
+    ),
+    max_retries=1,
 ).to_tool()
+
+# 把降级工具传给 Agent
+agent = create_agent(llm=llm, tools=[safe_weather])
+# Agent 无感知——正常时走 MCP，故障时自动切 fallback
 ```
 
-### 6.5 把自己的 LangChain Tool 暴露为 MCP 服务
+---
+
+### 6.5 把自己的 LangChain 工具暴露为 MCP 服务
+
+#### 反向流程：LangChain → MCP
+
+前面讲的是"消费 MCP 工具"（Client 端）。这里讲反向的——**把你已有的 LangChain 工具暴露出去，让其他 Agent 通过 MCP 协议调用**。
+
+```
+你的 LangChain @tool ──→ 注册到 FastMCP Server ──→ 其他 Agent 通过 MCP 调用
+```
+
+**使用场景**：
+- 团队 A 维护了一套 LangChain 工具 → 暴露为 MCP → 团队 B 的 Agent 直接调用
+- 微服务架构中，每个服务暴露自己的 MCP Server → 一个统一的 Agent 聚合所有服务
+
+#### 完整实现
 
 ```python
-# expose_as_mcp.py — 把已有的 LangChain Tool 注册到 MCP Server
+# ================================================================
+# expose_as_mcp.py — 把 LangChain 工具反向暴露为 MCP 服务
+# ================================================================
 from mcp.server.fastmcp import FastMCP
 from langchain.tools import tool
 
-# 已有的 LangChain 工具
+# === 1. 定义你已有的 LangChain 工具 ===
+# 这些工具可能已经在你项目中使用了很久，不需要修改
+
 @tool
 def calculate(expression: str) -> str:
-    """计算数学表达式。"""
-    return f"结果: {eval(expression)}"
+    """
+    计算数学表达式。
+
+    支持四则运算、幂运算（**）、取余（%）。
+    示例: '2 + 3 * 4', '10 ** 3', '100 % 7'。
+    返回计算结果。
+    """
+    try:
+        # 安全限制：只允许数字、运算符、括号、空格
+        allowed = set("0123456789+-*/().% **")
+        if not all(c in allowed for c in expression):
+            return "错误：表达式包含不允许的字符。"
+        result = eval(expression, {"__builtins__": {}}, {})
+        return f"计算结果: {result}"
+    except Exception as e:
+        return f"计算错误: {e}"
 
 @tool
-def search_kb(query: str) -> str:
-    """搜索内部知识库。"""
-    ...
+def search_knowledge_base(query: str, top_k: int = 5) -> str:
+    """
+    搜索内部知识库。
 
-# 创建 MCP Server 并注册
-mcp = FastMCP("My Tool Service", port=8002)
+    参数 query: 搜索查询（支持自然语言）
+    参数 top_k: 返回结果数量（1~20）
+    返回匹配的文档标题和摘要。
+    """
+    # 模拟知识库搜索
+    results = [
+        ("Python 编码规范", "本文档定义了公司 Python 代码风格..."),
+        ("部署手册 v3.2", "生产环境部署步骤：1. 构建镜像..."),
+        ("API 文档", "REST API 接口说明：base_url=/api/v1/..."),
+    ]
+    matched = [f"• {title}: {snippet[:60]}..." for title, snippet in results[:top_k]]
+    return f"搜索 '{query}' 的结果（共 {len(matched)} 条）：\n" + "\n".join(matched)
 
-# LangChain Tool → MCP Tool
-mcp.add_tool(calculate.func, name="calculate", description=calculate.description)
-mcp.add_tool(search_kb.func, name="search_kb", description=search_kb.description)
+# === 2. 创建 MCP Server 并注册工具 ===
+# 关键点：LangChain @tool → MCP tool 的转换
+# add_tool() 需要的参数：
+#   fn:         工具的实际执行函数（calculate.func → 去掉 @tool 装饰器后的原始函数）
+#   name:       工具名称（LLM 用这个名称调用）
+#   description: 工具描述（LLM 据此判断何时调用，使用 LangChain 工具的 docstring）
 
+mcp = FastMCP("Internal Tool Service")
+
+# 注册 calculate 工具
+mcp.add_tool(
+    fn=calculate.func,            # ← .func 是原始函数（去掉 @tool 包装）
+    name="calculate",
+    description=calculate.description,  # ← 沿用 LangChain @tool 的 docstring
+)
+
+# 注册 search_knowledge_base 工具
+mcp.add_tool(
+    fn=search_knowledge_base.func,
+    name="search_knowledge_base",
+    description=search_knowledge_base.description,
+)
+
+# 也可以手动注册一个未用 @tool 装饰的普通函数
+def get_system_time() -> str:
+    """获取系统当前时间。"""
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+mcp.add_tool(
+    fn=get_system_time,
+    name="get_system_time",
+    description="获取服务器当前系统时间。不需要参数。",
+)
+
+# === 3. 启动 MCP Server ===
 if __name__ == "__main__":
+    print("🚀 启动 Internal Tool MCP Server...")
     mcp.run(transport="stdio")
+    # 其他 Agent 现在可以通过 MCP 协议调用 calculate / search_kb / get_system_time
 ```
+
+---
 
 ### 6.6 远程 MCP 服务 + 本地混合配置
 
+#### 架构场景
+
+生产环境中，不是所有 MCP Server 都跑在本地。典型的混合架构：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Agent 所在的机器                            │
+│                                                                 │
+│  ┌──────────────────────┐    网络     ┌──────────────────────┐  │
+│  │  本地 MCP Server      │            │  远程 MCP Server      │  │
+│  │  weather_server.py    │           │  search-api.example.com│  │
+│  │  file_server.py       │           │  db-api.internal.com   │  │
+│  │  (通过 stdio 连接)     │           │  (通过 HTTP 连接)       │  │
+│  └──────────────────────┘            └──────────────────────┘  │
+│           │                                     │               │
+│           └────────────┬────────────────────────┘               │
+│                        ▼                                        │
+│               ClientSessionGroup                                │
+│               （统一聚合所有工具）                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 完整实现
+
 ```python
-# 配置清单：本地 MCP + 远程 MCP + HTTP MCP 全部接入
-import asyncio
+# ================================================================
+# hybrid_mcp_agent.py — 本地 + 远程 MCP 统一接入
+# ================================================================
+import asyncio, contextlib, os
 from mcp import StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.client.session import ClientSession
 from mcp.client.session_group import ClientSessionGroup
 from mcp.client.streamable_http import streamablehttp_client
+from langchain_mcp import MCPToolkit
+from langchain.agents import create_agent
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
-server_configs = {
-    # === 本地 MCP 服务（stdio 方式）===
-    "local_weather": StdioServerParameters(
-        command="python", args=["weather_server.py"],
+# === 1. 定义所有 MCP Server 配置 ===
+# 本地 Server 用 StdioServerParameters（启动子进程）
+# 远程 Server 用 HTTP URL（通过 HTTP/SSE 连接）
+SERVER_CONFIGS = {
+    # ─── 本地 MCP 服务（stdio）───
+    # StdioServerParameters 会让 Client 启动一个子进程并建立 stdio 通信
+    "weather": StdioServerParameters(
+        command="python",
+        args=["weather_server.py"],
+        # 可选：传环境变量
+        # env={"API_KEY": os.getenv("WEATHER_API_KEY", "")},
     ),
-    "local_file": StdioServerParameters(
-        command="python", args=["file_server.py"],
+    "calculator": StdioServerParameters(
+        command="python",
+        args=["calculator_server.py"],
     ),
 
-    # === 远程 MCP 服务（HTTP 方式）===
-    # 通过 streamable HTTP 连接远程 MCP Server
-    "remote_search": "https://api.example.com/mcp/search",
-    "remote_database": "https://db.internal.com/mcp",
+    # ─── 远程 MCP 服务（HTTP）───
+    # 远程 Server 已经以 HTTP 方式运行在别的机器上
+    # URL 指向它的 streamable_http_path（默认 /mcp）
+    "enterprise_search": "https://search-api.internal.company.com/mcp",
+    "user_database": "https://user-db.internal.company.com/mcp",
 }
 
-async def create_mcp_agent(llm):
-    """创建混合 MCP Agent：本地 + 远程工具全部接入。"""
-    import httpx
+
+async def create_hybrid_mcp_agent():
+    """
+    创建混合 MCP Agent。
+
+    统一处理本地和远程 MCP Server：
+      - 本地（StdioServerParameters）→ 用 stdio_client 建立连接
+      - 远程（HTTP URL）           → 用 streamablehttp_client 建立连接
+      - 所有工具自动聚合，前缀防重名
+    """
     all_tools = []
     exit_stack = contextlib.AsyncExitStack()
 
-    # --- 加载本地 MCP 工具 ---
-    for name, params in server_configs.items():
-        if isinstance(params, StdioServerParameters):
+    for name, config in SERVER_CONFIGS.items():
+        if isinstance(config, StdioServerParameters):
+            # =========================================
+            # 本地 MCP Server：启动子进程 + stdio 连接
+            # =========================================
+
+            # 第 1 步：建立 stdio 传输通道
+            # stdio_client(config) 内部：
+            #   ① 启动子进程
+            #   ② 返回 (read_stream, write_stream) 双向通信对
             transport = await exit_stack.enter_async_context(
-                stdio_client(params)
+                stdio_client(config)
             )
+
+            # 第 2 步：在传输通道上创建 MCP 会话
             session = await exit_stack.enter_async_context(
                 ClientSession(transport[0], transport[1])
             )
+
+            # 第 3 步：通过 MCPToolkit 获取工具
             toolkit = MCPToolkit(session=session)
             await toolkit.initialize()
-            for t in toolkit.get_tools():
-                t.name = f"{name}_{t.name}"  # 加前缀防止重名
-                all_tools.append(t)
 
-    # --- 加载远程 MCP 工具（HTTP 方式）---
-    for name, url in server_configs.items():
-        if isinstance(url, str) and url.startswith("http"):
-            async for transport in streamablehttp_client(
-                url=url,
-                headers={"Authorization": f"Bearer {os.getenv('MCP_TOKEN')}"},
-                timeout=30,
-            ):
-                session = ClientSession(transport[0], transport[1])
-                await session.initialize()
-                toolkit = MCPToolkit(session=session)
-                await toolkit.initialize()
-                for t in toolkit.get_tools():
-                    t.name = f"{name}_{t.name}"
-                    all_tools.append(t)
-                break  # 只取第一次连接
+        elif isinstance(config, str) and config.startswith("http"):
+            # =========================================
+            # 远程 MCP Server：HTTP/SSE 连接
+            # =========================================
 
-    # --- 创建 Agent ---
-    agent = create_agent(llm=llm, tools=all_tools)
+            # streamablehttp_client 返回异步生成器
+            # 每次迭代返回 (read_stream, write_stream, get_id)
+            gen = streamablehttp_client(
+                url=config,
+                headers={
+                    "Authorization": f"Bearer {os.getenv('MCP_AUTH_TOKEN', '')}",
+                    "X-Client-Version": "1.0.0",
+                },
+                timeout=30.0,              # 请求超时
+                sse_read_timeout=300.0,     # 长连接读取超时（Agent 可能长时间等待）
+                terminate_on_close=True,    # 连接关闭时通知服务端
+            )
+            transport = await exit_stack.enter_async_context(gen)
+
+            session = await exit_stack.enter_async_context(
+                ClientSession(transport[0], transport[1])
+            )
+            await session.initialize()
+            toolkit = MCPToolkit(session=session)
+            await toolkit.initialize()
+
+        else:
+            print(f"⚠️ 跳过未知配置类型: {name}")
+            continue
+
+        # === 加前缀防重名 ===
+        # 不同 MCP Server 可能有同名工具（如两个 Server 都有 search）
+        # 加前缀后：weather_search 和 enterprise_search 不会冲突
+        for t in toolkit.get_tools():
+            t.name = f"{name}_{t.name}"
+            all_tools.append(t)
+
+        print(f"  ✅ [{name}] 加载了 {len(toolkit.get_tools())} 个工具")
+
+    # === 创建 Agent ===
+    llm = ChatOpenAI(model="deepseek-v4-pro", temperature=0.7)
+    agent = create_agent(
+        llm=llm,
+        tools=all_tools,
+        system_prompt=(
+            "你是企业智能助手，拥有天气查询、计算、搜索和数据库访问能力。"
+            "需要查询信息时主动使用可用工具。"
+        ),
+    )
+
+    print(f"\n📦 共加载 {len(all_tools)} 个 MCP 工具（来自 {len(SERVER_CONFIGS)} 个 Server）")
     return agent, exit_stack
+
+
+async def main():
+    agent, exit_stack = await create_hybrid_mcp_agent()
+
+    # 测试：Agent 能同时使用本地和远程工具
+    config = {"configurable": {"thread_id": "hybrid_demo"}}
+    result = agent.invoke(
+        {"messages": [HumanMessage("北京今天天气怎么样？帮我算 15*8")]},
+        config=config,
+    )
+    print(f"\n🤖 Agent: {result['messages'][-1].content}")
+
+    # 清理资源
+    await exit_stack.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-### 6.7 HTTP MCP 配置详解
+---
+
+### 6.7 HTTP MCP 传输详解
+
+#### 6.7.1 两种 HTTP 传输方式
+
+MCP 协议支持两种基于 HTTP 的传输方式，不同场景选不同方式：
+
+| | Streamable HTTP | SSE (Server-Sent Events) |
+|---|---|---|
+| **通信方向** | 双向（全双工） | 单向（服务端 → 客户端推送） |
+| **连接模式** | 一个 POST + 一个 SSE 长连接 | 纯 SSE 长连接 |
+| **适用场景** | Agent 需要收发流式数据 | 客户端只读推送 |
+| **协议版本** | MCP 2024-11-05+ | MCP 早期版本 |
+| **推荐度** | ★★★★ 推荐 | 遗留兼容 |
+
+**Streamable HTTP 的工作原理**：
+
+```
+Client                                           Server
+  │                                                 │
+  │ ① POST /mcp (JSON-RPC initialize 请求)          │
+  │ ──────────────────────────────────────────────→ │
+  │                                                 │
+  │ ② 200 OK (JSON-RPC initialize 响应)             │
+  │    Header: Mcp-Session-Id: abc123               │
+  │ ←────────────────────────────────────────────── │
+  │                                                 │
+  │ ③ POST /mcp (JSON-RPC tools/list 请求)          │
+  │    Header: Mcp-Session-Id: abc123               │
+  │ ──────────────────────────────────────────────→ │
+  │                                                 │
+  │ ④ 200 OK (工具列表 JSON-RPC 响应)                │
+  │ ←────────────────────────────────────────────── │
+  │                                                 │
+  │ ⑤ POST /mcp (JSON-RPC tools/call 请求)          │
+  │    Header: Mcp-Session-Id: abc123               │
+  │    Accept: text/event-stream                    │
+  │ ──────────────────────────────────────────────→ │
+  │                                                 │
+  │ ⑥ 200 OK (SSE 流式响应)                          │
+  │    包含工具执行的流式结果                           │
+  │ ← ─ ─ ─ SSE Stream ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─    │
+```
+
+#### 6.7.2 配置参数详解
 
 ```python
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.client.sse import sse_client
 
-# === 方式1：Streamable HTTP（推荐）===
-# 适合大多数远程场景，支持全双工通信
 async with streamablehttp_client(
+    # ===== 连接参数 =====
     url="https://mcp-server.example.com/mcp",
-    headers={"Authorization": f"Bearer {token}"},
-    timeout=30,              # 请求超时
-    sse_read_timeout=300,    # SSE 流读取超时（长连接）
-) as (read, write, get_id):
-    session = ClientSession(read, write)
+    # ↑ MCP Server 的 HTTP 端点地址
+    # 对应 FastMCP 的 streamable_http_path 参数（默认 "/mcp"）
+
+    # ===== 认证参数 =====
+    headers={
+        "Authorization": f"Bearer {os.getenv('MCP_TOKEN')}",
+        # ↑ 身份认证：Bearer Token（生产环境必须）
+        "X-Client-ID": "agent-prod-01",
+        # ↑ 客户端标识：便于服务端追踪和日志
+        "X-Client-Version": "1.0.0",
+        # ↑ 客户端版本：便于服务端做兼容性处理
+    },
+
+    # ===== 超时参数 =====
+    timeout=30.0,
+    # ↑ 单次 HTTP 请求的超时时间（秒）
+    # 包括：建立连接 + 发送请求 + 接收响应头
+    # 太短：正常慢请求被截断 → Agent 误判工具故障
+    # 太长：故障时 Agent 等待过久 → 用户体验差
+    # 推荐值：30s（REST API 通常的响应时间上限）
+
+    sse_read_timeout=300.0,
+    # ↑ SSE 流读取超时（秒）
+    # SSE 是长连接——Server 持续推送事件
+    # 工具执行可能需要几分钟（如大型数据库查询）
+    # 这个超时控制的是"两次事件之间的最大间隔"
+    # 推荐值：300s（5 分钟），让长时间工具执行有足够窗口
+
+    # ===== 生命周期参数 =====
+    terminate_on_close=True,
+    # ↑ Client 关闭连接时是否通知 Server
+    # True：发送关闭信号 → Server 清理会话资源 → 避免资源泄漏
+    # False：直接断开 → Server 需要等超时才能清理（不推荐）
+
+    # ===== 高级参数 =====
+    # httpx_client_factory: 自定义 HTTP 客户端工厂
+    #   → 可传入自定义 httpx.AsyncClient（带代理、自定义 TLS 等）
+    # auth: httpx.Auth 对象
+    #   → 除了 headers 中的 Bearer Token，也可用 httpx 原生的 Auth 机制
+) as (read_stream, write_stream, get_session_id):
+    # read_stream:  从 Server 接收消息（MemoryObjectReceiveStream）
+    # write_stream: 向 Server 发送消息（MemoryObjectSendStream）
+    # get_session_id: 返回当前会话 ID 或 None
+    session = ClientSession(read_stream, write_stream)
     await session.initialize()
     tools = (await session.list_tools()).tools
-
-# === 方式2：SSE（Server-Sent Events）===
-# 适合只读流场景，单向推送
-async with sse_client(
-    url="https://mcp-server.example.com/sse",
-    headers={"Authorization": f"Bearer {token}"},
-) as (read, write):
-    session = ClientSession(read, write)
-    await session.initialize()
 ```
 
-**HTTP 配置关键参数**：
+#### 6.7.3 本地 HTTP 调试配置
 
-| 参数 | 建议值 | 说明 |
-|---|---|---|
-| `timeout` | `30` | 单次请求超时，太短会导致正常请求失败 |
-| `sse_read_timeout` | `300` | SSE 长连接超时，Agent 调用工具后等待结果时依赖此值 |
-| `headers` | `{"Authorization": "Bearer xxx"}` | 身份认证，生产环境必须 |
-| `terminate_on_close` | `True` | 客户端关闭时通知服务端清理资源 |
+在本地开发时，Server 和 Client 通常在同一台机器上。FastMCP 可以同时启动 HTTP 模式而非 stdio：
+
+```python
+# 开发/调试时用 HTTP 模式（可以 curl 测试）：
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")  # 默认监听 127.0.0.1:8000/mcp
+    # 启动后可以通过 curl http://localhost:8000/mcp 测试
+
+# 生产环境通常用 stdio（更安全，不需要暴露端口）：
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+```
 
 ### 6.8 MCP 标准 vs MultiServerMCP（ClientSessionGroup）
 

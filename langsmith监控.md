@@ -1,0 +1,583 @@
+# LangSmith 监控与可观测性教学
+
+## 第一章：LangSmith 核心概念
+
+### 1.1 什么是 LangSmith
+
+**LangSmith = LangChain 生态的官方可观测性平台**。它回答四个问题：
+
+| 问题 | 没有 LangSmith | 有 LangSmith |
+|---|---|---|
+| 这条链内部发生了什么？ | 黑盒——只知道输入和输出 | 每一步的输入/输出/耗时完整可视 |
+| 为什么这次回答质量差？ | 猜——可能 Prompt 不对、检索不准、LLM 幻觉 | 精准定位——看检索结果、看 Prompt 实际内容、看 LLM 参数 |
+| 这次调用花了多少 Token/钱？ | 不知道——直到月底账单 | 实时——每次调用的 Token 明细和成本 |
+| 用户对这个回答满意吗？ | 不知道——除非用户主动反馈 | 每条 Trace 绑定 thumbs up/down |
+
+**一句话**：LangSmith 让 LLM 应用从"黑盒"变成"透明玻璃盒"——每一步都可看、可查、可优化。
+
+### 1.2 两大核心功能
+
+#### 功能 1：覆盖链路的追踪日志与实时分析
+
+```
+你的代码（零改动）                LangSmith 平台
+─────────────────                ─────────────
+                                  ┌─────────────────────────┐
+chain.invoke("What is RAG?")      │  Trace #1                │
+  │                               │  ├─ Run: retriever       │
+  ├─ retriever 检索                │  │   input: "What is RAG?"│
+  │    ↓                          │  │   output: [Doc, Doc]  │
+  │  返回 [Doc, Doc]              │  │   latency: 0.23s      │
+  │                               │  │                       │
+  ├─ LLM 生成回答                  │  ├─ Run: ChatOpenAI     │
+  │    ↓                          │  │   input: Prompt + Docs│
+  │  返回 "RAG is..."              │  │   output: "RAG is..."│
+  │                               │  │   tokens: 320 in/80 out│
+  └─ 返回给用户                    │  │   cost: $0.002        │
+                                  │  │   latency: 1.2s       │
+                                  │  └───────────────────────│
+                                  │  Total: 1.5s, $0.002     │
+                                  └─────────────────────────┘
+```
+
+**实时分析能力**：
+- 延迟分布：P50/P95/P99 延迟曲线
+- Token 趋势：按小时/天查看 Token 消耗趋势
+- 错误率监控：异常 Trace 自动标记
+- 成本可视化：按项目/按模型/按用户拆分成本
+
+#### 功能 2：构建集成的监控与调试环境
+
+LangSmith 不只是"看"，还能"改"和"评估"：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 LangSmith 监控调试工作流                       │
+│                                                             │
+│  发现问题                                                     │
+│    │  用户反馈："这个回答不对"                                  │
+│    ▼                                                        │
+│  定位 Trace                                                   │
+│    │  在 LangSmith 中找到该用户的调用记录                       │
+│    ▼                                                        │
+│  分析每一步                                                   │
+│    │  展开 Run → 看检索结果 → 发现返回了不相关的文档             │
+│    ▼                                                        │
+│  调试修改                                                     │
+│    │  修改 Retriever 参数（k=3→k=5）                          │
+│    ▼                                                        │
+│  对比回归                                                     │
+│    │  用同一输入跑新旧两个版本 → 对比结果                       │
+│    ▼                                                        │
+│  添加评估                                                     │
+│    │  为这个场景添加测试用例 → 持续监控                        │
+│    ▼                                                        │
+│  上线监控                                                     │
+│       自动化评估 + 异常告警                                     │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 第二章：核心对象模型
+
+### 2.1 层级关系
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Project                              │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │                    Trace #1                            │ │
+│  │  ┌──────────────────────────────────────────────┐    │ │
+│  │  │              Run: retriever                   │    │ │
+│  │  │  input → output, latency, tokens, metadata   │    │ │
+│  │  └──────────────────────────────────────────────┘    │ │
+│  │  ┌──────────────────────────────────────────────┐    │ │
+│  │  │              Run: ChatOpenAI                   │    │ │
+│  │  │  input → output, latency, tokens, metadata   │    │ │
+│  │  │      ┌─────────────────────────────────┐     │ │
+│  │  │      │  Run: tool_call (get_weather)    │     │ │
+│  │  │      │  input → output                  │     │ │
+│  │  │      └─────────────────────────────────┘     │ │
+│  │  └──────────────────────────────────────────────┘    │ │
+│  │  Feedback: 👍 (thumbs up)                            │ │
+│  │  Tags: ["production", "v2"]                           │ │
+│  │  Metadata: {"user_id": "alice", "session": "abc"}    │ │
+│  └───────────────────────────────────────────────────────┘ │
+│                                                             │
+│  ┌───────────────────────────────────────────────────────┐ │
+│  │                    Trace #2                            │ │
+│  │  ...                                                   │ │
+│  └───────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 五个核心对象详解
+
+#### Project（项目）
+
+**LangSmith 的顶层组织单元。** 一个 Project = 一个应用/服务/实验。
+
+| 属性 | 说明 | 示例 |
+|---|---|---|
+| 名称 | 唯一标识 | `"my-rag-agent"`, `"customer-service-bot"` |
+| 包含 | 所有 Trace | 该应用产生的所有调用记录 |
+| 环境变量 | `LANGCHAIN_PROJECT` | 代码中设置，自动归属 |
+
+**常见组织方式**：
+
+```
+方式 A（按应用）：
+  my-rag-agent        ← 一个 Project
+  customer-bot        ← 另一个 Project
+
+方式 B（按环境）：
+  my-app-dev          ← 开发环境
+  my-app-staging      ← 预发布环境
+  my-app-prod         ← 生产环境
+
+方式 C（按实验）：
+  rag-experiment-v1   ← 实验组 1
+  rag-experiment-v2   ← 实验组 2（对比 A/B 测试）
+```
+
+#### Trace（追踪）
+
+**一次完整的端到端调用。** 对应一次 `chain.invoke()` 或 `agent.invoke()`。
+
+```
+Trace = 用户请求 → 系统处理 → 返回响应 的完整记录
+
+一次 Trace 包含：
+  ├─ 一个根 Run
+  ├─ N 个子 Run（嵌套层级 = 调用链深度）
+  ├─ 0~N 个 Feedback（用户评价）
+  ├─ Tags（分类标签）
+  └─ Metadata（自定义元数据）
+```
+
+**Trace 的生命周期**：
+
+```
+创建 → 运行中 → 完成（成功/失败）
+                   │
+                   ├─ Feedback 追加（异步，可能在 Trace 完成后很久）
+                   └─ 永久保留（除非主动删除）
+```
+
+#### Run（运行单元）
+
+**Trace 中的一个执行步骤。** 每个 Runnable 的每次调用产生一个 Run。
+
+```
+chain.invoke(input)
+  ├─ Run #1: retriever.invoke(input)      ← 子 Run
+  ├─ Run #2: prompt.invoke(dict)          ← 子 Run
+  ├─ Run #3: llm.invoke(messages)         ← 子 Run
+  │    ├─ Run #3a: tool_call(get_weather) ← 子 Run 的子 Run
+  │    └─ Run #3b: tool_call(search_web)
+  └─ Run #4: parser.invoke(ai_message)    ← 子 Run
+```
+
+**Run 记录的核心数据**：
+
+| 字段 | 说明 | 示例 |
+|---|---|---|
+| `name` | Runnable 名称 | `"ChatOpenAI"`, `"retriever"`, `"RunnableSequence"` |
+| `run_type` | 运行类型 | `"llm"`, `"chain"`, `"tool"`, `"retriever"`, `"prompt"` |
+| `inputs` | 输入数据 | `{"messages": [...]}` |
+| `outputs` | 输出数据 | `AIMessage(content="...")` |
+| `start_time` / `end_time` | 开始/结束时间 | 用于计算 latency |
+| `error` | 错误信息 | `None` 或异常对象 |
+| `total_tokens` / `prompt_tokens` / `completion_tokens` | Token 用量 | `350` / `300` / `50` |
+| `parent_run_id` | 父 Run ID | 构建嵌套层级关系 |
+
+#### Feedback（反馈）
+
+**对 Trace 或 Run 的评价。** 可以来自用户（thumbs up/down）或自动评估。
+
+```python
+from langsmith import Client
+
+client = Client()
+
+# 人工反馈：用户点了 👍
+client.create_feedback(
+    run_id="abc-123",
+    key="user_feedback",       # 反馈类型
+    score=1,                   # 1=正面, 0=负面
+    comment="回答很准确！",
+)
+
+# 自动反馈：评估系统打分
+client.create_feedback(
+    run_id="abc-123",
+    key="correctness",         # 正确性评分
+    score=0.95,                # 0~1 分数
+    comment="自动评估：回答与参考答案匹配度 95%",
+)
+```
+
+**Feedback 的用途**：
+
+| 用途 | 反馈 Key | 来源 |
+|---|---|---|
+| 用户满意度 | `user_feedback` | 用户 👍/👎 |
+| 回答正确性 | `correctness` | 自动评估（对比参考答案） |
+| 回答相关性 | `relevance` | 自动评估 |
+| 毒性检测 | `toxicity` | 自动评估 |
+| 幻觉检测 | `hallucination` | 自动评估 |
+| 人工审核 | `human_review` | 审核员标记 |
+
+#### Tags（标签）与 Metadata（元数据）
+
+**Tags = 分类维度，Metadata = 上下文信息。**
+
+```python
+# 在 invoke 时传入
+chain.invoke(
+    input,
+    config={
+        "tags": ["production", "v2.1"],         # ← Tags: 简短标签
+        "metadata": {                           # ← Metadata: 结构化信息
+            "user_id": "alice",
+            "session_id": "chat_abc123",
+            "deployment": "us-east-1",
+            "experiment": "new_prompt_v3",
+        },
+    },
+)
+```
+
+| | Tags | Metadata |
+|---|---|---|
+| **类型** | `list[str]` | `dict[str, Any]` |
+| **用途** | 分类、过滤、分组 | 携带业务上下文 |
+| **示例** | `["production", "v2"]` | `{"user_id":"alice", "plan":"enterprise"}` |
+| **查询** | `按 tag="production" 过滤` | `按 metadata.user_id="alice" 过滤` |
+| **典型场景** | A/B 测试分组、环境标识 | 用户 ID、会话 ID、部署区域 |
+
+---
+
+## 第三章：使用方法与配置
+
+### 3.1 最小化配置（3 行代码启用）
+
+```bash
+# 1. 安装
+pip install langsmith
+
+# 2. 设置环境变量
+export LANGCHAIN_TRACING_V2=true
+export LANGCHAIN_API_KEY="lsv2_pt_..."    # 从 https://smith.langchain.com 获取
+export LANGCHAIN_PROJECT="my-rag-agent"   # Trace 归属的 Project
+```
+
+**代码零改动。** 设置这三个环境变量后，所有 `chain.invoke()` / `agent.invoke()` 自动上报到 LangSmith。
+
+```
+环境变量设置前：                                设置后：
+  chain.invoke() → 结果                          chain.invoke() → 结果
+                                                    │
+                                                    ▼
+                                              LangSmith 自动捕获
+                                              (Trace → Run → Token → Latency)
+```
+
+### 3.2 代码中显式配置
+
+```python
+import os
+from langsmith import Client
+
+# === 方式 1：环境变量（推荐，全局生效）===
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = "lsv2_pt_your_key"
+os.environ["LANGCHAIN_PROJECT"] = "my-rag-agent"
+
+# === 方式 2：代码中传 config（每次调用单独配置）===
+from langchain_core.runnables import RunnableConfig
+
+chain.invoke(
+    input,
+    config=RunnableConfig(
+        tags=["production", "v2.1"],
+        metadata={
+            "user_id": "alice",
+            "session_id": "chat_abc",
+        },
+        run_name="alice_question_about_rag",  # ← 给这次 Trace 取个名字
+    ),
+)
+
+# === 方式 3：在 Runnable 上绑定配置 ===
+tagged_chain = chain.with_config(
+    tags=["production"],
+    metadata={"environment": "prod"},
+)
+# 之后 tagged_chain 的所有调用都带这些 tags/metadata
+```
+
+### 3.3 自定义 Trace 上报
+
+```python
+from langsmith import traceable
+
+# === 方式 1：装饰器（监控任意函数）===
+@traceable(run_type="tool", name="my_custom_tool")
+def my_function(query: str) -> str:
+    """这个函数的每次调用都会作为 Run 上报到 LangSmith。"""
+    return f"处理 {query}"
+
+# === 方式 2：手动创建 Trace ===
+from langsmith import Client
+
+client = Client()
+
+# 手动创建一个 Run
+run = client.create_run(
+    name="manual_check",
+    run_type="chain",
+    inputs={"question": "What is RAG?"},
+    project_name="my-rag-agent",
+)
+# ... 执行业务逻辑 ...
+client.update_run(
+    run.id,
+    outputs={"answer": "RAG is Retrieval-Augmented Generation."},
+    end_time=...,  # 自动记录耗时
+)
+```
+
+### 3.4 在 LangSmith 平台中查看
+
+#### 查看 Trace 详情
+
+```
+Trace 详情页：
+┌─────────────────────────────────────────────────────────────┐
+│ Trace: alice_question_about_rag                              │
+│ Project: my-rag-agent                                       │
+│ Tags: [production, v2.1]                                    │
+│ Latency: 2.3s │ Tokens: 520 │ Cost: $0.003                 │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ▼ RunnableSequence (chain)                          2.3s   │
+│    ├─ Input: {"question": "What is RAG?"}                   │
+│    ├─ Output: "RAG (Retrieval-Augmented Generation)..."     │
+│    │                                                        │
+│    ▼ retriever                                    0.23s     │
+│      ├─ Input: "What is RAG?"                               │
+│      ├─ Output: [Document("RAG is..."), Document("...")]    │
+│      └─ Metadata: {"k": 4, "search_type": "similarity"}    │
+│                                                             │
+│    ▼ ChatOpenAI                                   1.07s     │
+│      ├─ Input: [SystemMessage, HumanMessage]                │
+│      ├─ Output: AIMessage("RAG (Retrieval-Augmented...)")   │
+│      ├─ Tokens: 320 prompt + 80 completion = 400 total     │
+│      ├─ Model: deepseek-v4-pro                              │
+│      ├─ Temperature: 0.7                                    │
+│      └─ Cost: $0.002                                        │
+│                                                             │
+│  Feedback: 👍 (thumbs up, "回答很准确")                      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 过滤与搜索
+
+```
+LangSmith 查询语法：
+
+# 按 Tags 过滤
+tags:production
+
+# 按 Metadata 过滤
+metadata.user_id:alice
+
+# 按 Run 类型过滤
+run_type:llm
+
+# 按错误过滤
+error:*
+
+# 组合查询
+tags:production AND run_type:llm AND error:*
+
+# 按时间过滤
+start_time:[2026-05-01 TO 2026-05-10]
+```
+
+### 3.5 采样配置（控制上报量）
+
+```python
+# 环境变量控制采样率（生产环境推荐）
+os.environ["LANGCHAIN_TRACING_SAMPLING_RATE"] = "0.1"
+# ↑ 只上报 10% 的 Trace。减少存储和网络开销。
+# 生产环境高并发时建议 0.01~0.1
+```
+
+---
+
+## 第四章：常见使用场景
+
+### 场景 1：定位性能瓶颈
+
+```
+步骤：
+1. 在 LangSmith 中打开 Project
+2. 按 "Latency" 降序排列 Trace
+3. 展开最慢的几个 Trace
+4. 看哪个 Run 耗时最长 → 这就是瓶颈
+
+示例：
+  Trace latency: 8.5s
+  ├─ retriever: 0.3s  ✓ 正常
+  ├─ LLM call #1: 1.2s ✓ 正常
+  ├─ LLM call #2: 6.8s ✗ 异常！分析：这次 LLM 输入 token 过多 → 需要上下文裁剪
+  └─ parser: 0.1s   ✓ 正常
+
+结论：LLM 第二次调用的 Prompt 太长。优化 → 加 SummarizationMiddleware。
+```
+
+### 场景 2：对比实验（A/B 测试）
+
+```python
+# 实验 A：用不同 Prompt
+chain_a = (
+    prompt_v1 | llm | parser
+).with_config(tags=["experiment:prompt_v1"])
+
+# 实验 B：用不同 Prompt
+chain_b = (
+    prompt_v2 | llm | parser
+).with_config(tags=["experiment:prompt_v2"])
+
+# 同时跑 100 条测试
+for q in test_questions:
+    chain_a.invoke(q)  # → LangSmith 中标签 experiment:prompt_v1
+    chain_b.invoke(q)  # → LangSmith 中标签 experiment:prompt_v2
+
+# 然后在 LangSmith 中：
+# 1. 按 tags 分组 → 查看两组 Trace
+# 2. 对比平均 latency、Token 用量、Feedback 评分
+# 3. 决定哪个 Prompt 更好
+```
+
+### 场景 3：Debug 单条错误 Trace
+
+```
+用户反馈："这个回答完全不对！"
+
+调试流程：
+1. 用用户 ID + 时间范围找到该 Trace
+2. 展开 Run → 看 retriever 的输出
+   → 发现：检索到的 4 个 Document 和用户问题完全不相关
+3. 看 embedding 模型 → 发现用了英文模型处理中文问题
+4. 修复：换成 BAAI/bge-small-zh-v1.5（中文嵌入模型）
+5. 重新测试 → 检索准确 → 回答正确
+
+整个流程不需要在生产环境加日志、不需要重新部署、不需要复现。
+```
+
+### 场景 4：成本追踪
+
+```
+LangSmith 自动展示每次 LLM 调用的 Token 用量和成本：
+
+1. 按 Project 查看总成本趋势图
+2. 按 Model 查看各模型成本占比
+3. 按 Trace 查看单次调用成本
+4. 设置成本告警：日消费 > $50 → 发通知
+
+优化方向：
+  - 发现 80% 成本来自 20% 的长 Trace → 优化高频问题的缓存
+  - 发现某个用户占用 40% Token → 检查是否有滥用
+```
+
+---
+
+## 第五章：完整配置速查
+
+```bash
+# ===== 必须设置 =====
+LANGCHAIN_TRACING_V2=true                     # 启用追踪
+LANGCHAIN_API_KEY=lsv2_pt_your_key             # API Key
+LANGCHAIN_PROJECT=my-project                   # Project 名称
+
+# ===== 可选设置 =====
+LANGCHAIN_ENDPOINT=https://api.smith.langchain.com  # API 端点（SaaS 默认）
+LANGCHAIN_TRACING_SAMPLING_RATE=0.1                # 采样率 0~1
+
+# ===== 自托管（私有化部署）=====
+LANGCHAIN_ENDPOINT=https://langsmith.internal.company.com  # 自托管地址
+```
+
+```python
+# ===== 代码配置速查 =====
+from langchain_core.runnables import RunnableConfig
+
+# invoke 时带配置
+chain.invoke(input, config=RunnableConfig(
+    tags=["tag1", "tag2"],
+    metadata={"key": "value"},
+    run_name="my_custom_trace_name",
+))
+
+# 绑定到 Chain
+chain.with_config(
+    tags=["production"],
+    metadata={"env": "prod"},
+)
+
+# 自定义追踪
+from langsmith import traceable
+@traceable(run_type="tool")
+def my_tool(x): return x
+
+# 手动上报 Feedback
+from langsmith import Client
+Client().create_feedback(run_id, key="user_feedback", score=1)
+
+# 按条件查询
+from langsmith import Client
+client = Client()
+runs = client.list_runs(
+    project_name="my-project",
+    filter='eq(tags, "production")',
+)
+```
+
+---
+
+## 第六章：核心要点总结
+
+```
+LangSmith 做了什么：
+  你的 Chain (零改动) ──→ 自动上报 ──→ LangSmith 平台
+                                             │
+                              ┌──────────────┼──────────────┐
+                              │              │              │
+                           追踪日志       实时分析      监控调试
+                              │              │              │
+                        Project/Trace   延迟/Token/    每步输入输出
+                        /Run/Feedback   成本趋势      可视可查
+                              │              │              │
+                              └──────────────┴──────────────┘
+                                             │
+                                    让 LLM 应用从黑盒
+                                    变成透明玻璃盒
+
+核心对象层级：
+  Project > Trace > Run (可嵌套) > Feedback
+             │        │
+           Tags    Metadata
+
+三行启用：
+  LANGCHAIN_TRACING_V2=true
+  LANGCHAIN_API_KEY=...
+  LANGCHAIN_PROJECT=...
+
+典型工作流：
+  发现问题 → 找到 Trace → 展开 Run → 看每步数据 → 定位根因 → 修复 → 验证
+```
